@@ -42,7 +42,7 @@ PtxRegisterType = Literal[
 
 class RegisterStore:
     def __init__(self):
-        self.registry = {reg_type: [] for reg_type in get_args(PtxRegisterType)}
+        self.reg_counts = {reg_type: 0 for reg_type in get_args(PtxRegisterType)}
         self.bindings: dict[str, str] = {}
 
     @staticmethod
@@ -55,10 +55,13 @@ class RegisterStore:
     def get_reg(self, varname) -> str:
         return self.bindings[varname]
 
-    def new(self, type: PtxRegisterType) -> str:
-        reg_list = self.registry[type]
-        reg_list.append({"name": f"%{self.get_prefix(type)}{len(reg_list)}"})
-        return reg_list[-1]["name"]
+    def new(self, reg_type: PtxRegisterType, varname: str | None = None) -> str:
+        count = self.reg_counts[reg_type]
+        regname = f"%{self.get_prefix(reg_type)}{count}"
+        self.reg_counts[reg_type] += 1
+        if varname is not None:
+            self.bind(varname, regname)
+        return regname
 
 
 @dataclass
@@ -95,6 +98,7 @@ class PtxFunction:
         predicate: Predicate | None = None,
     ) -> None:
         self.instructions.append(PtxInstr(opcode, operands, predicate))
+
 
 @dataclass
 class PtxHeader:
@@ -134,18 +138,34 @@ class PtxCodegen:
     ) -> None:
         params = self.get_func_params(node_id, codegen_ctx)
         ptx_kernel.params = params
-
+        regs = ptx_kernel.registers
+        #  load and convert params addresses
         for param in params:
-            addr_reg = ptx_kernel.registers.new("b64")
-            ptx_kernel.registers.bind(param.name, addr_reg)
-            ptx_kernel.add_instr(
-                "ld.param.u64", addr_reg, "[" + param.name + "]"
-            )
+            addr_reg = regs.new("b64", param.name)
+            ptx_kernel.add_instr("ld.param.u64", addr_reg, "[" + param.name + "]")
         for param in params:
-            addr_reg = ptx_kernel.registers.get_reg(param.name)
-            gaddr_reg = ptx_kernel.registers.new("b64")
+            addr_reg = regs.get_reg(param.name)
+            gaddr_reg = regs.new("b64", param.name)
             ptx_kernel.add_instr("cvta.to.global.u64", gaddr_reg, addr_reg)
-            ptx_kernel.registers.bind(param.name, gaddr_reg)
+
+        # calculate gid
+        # TODO: optimize for when gid < 2^32
+        tid = regs.new("u32")
+        bid = regs.new("u32")
+        bdim = regs.new("u32")
+        tid64 = regs.new("u64")
+        gid = regs.new("u64", "gid")
+        warp = regs.new("u32", "warp")
+        lane = regs.new("u32", "lane")
+
+        ptx_kernel.add_instr("mov.u32", tid, "%tid.x")
+        ptx_kernel.add_instr("mov.u32", bid, "%ctaid.x")
+        ptx_kernel.add_instr("mov.u32", bdim, "%ntid.x")
+        ptx_kernel.add_instr("cvt.u64.u32", tid64, tid)
+        ptx_kernel.add_instr("mad.wide.u32", gid, bdim, bid, tid64)
+
+        ptx_kernel.add_instr("shr.u32", warp, tid, 5)
+        ptx_kernel.add_instr("and.b32", lane, tid, 31)
 
     def translate_kernel(
         self, node_id: str, kernel: KernelOp, codegen_ctx: PtxCodegenCtx
@@ -184,13 +204,13 @@ class PtxPrinter:
 
     def registers(self, registers: RegisterStore) -> list[str]:
         return [
-            f".reg .{reg_type:19} %{RegisterStore.get_prefix(reg_type)}<{len(vals)}>;"
-            for reg_type, vals in registers.registry.items()
-            if vals
+            f".reg .{reg_type:19} %{RegisterStore.get_prefix(reg_type)}<{count}>;"
+            for reg_type, count in registers.reg_counts.items()
+            if count
         ]
 
     def instruction(self, instr: PtxInstr) -> list[str]:
-        return f"{instr.opcode:25} {', '.join(instr.operands)};"
+        return f"{instr.opcode:25} {', '.join([str(op) for op in instr.operands])};"
 
     def kernel(self, kernel: PtxFunction) -> list[str]:
         return [
