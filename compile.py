@@ -1,5 +1,6 @@
 import json
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
@@ -72,6 +73,15 @@ class RegisterStore:
         if varname is not None:
             self.bind(varname, register)
         return register
+
+    @contextmanager
+    def scope(self):
+        outer = self.bindings
+        self.bindings = outer.copy()
+        try:
+            yield
+        finally:
+            self.bindings = outer
 
 
 @dataclass
@@ -160,6 +170,34 @@ class KernelLowerer:
         outofbounds = self.regs.new("pred")
         self.add_instr("setp.ge.u64", outofbounds, gid, N)
         self.add_instr("ret", predicate=Predicate(reg=outofbounds))
+
+        def divmod_64(a, b) -> tuple[str, str]:
+            """Returns regs holding u64 quotient and remainder."""
+            q = self.regs.new("u64")
+            r = self.regs.new("u64")
+            prod = self.regs.new("u64")
+
+            self.add_instr("div.u64", q, a, b)
+            self.add_instr("mul.lo.u64", prod, q, b)
+            self.add_instr("sub.u64", r, a, prod)
+            return q, r
+
+        def bind_axes():
+            # Decode per axis indices from gid, innermost axis is fastest moving
+            # e.g axis: (i, j, k) => gid = k + Dk*(j + Dj*i)
+            # TODO: optimize: use u32 if gid<2^32. try optimized instructions when axis.extent is power of two.
+            remaining = self.regs.new("u64")
+            self.add_instr("mov.b64", remaining, gid)
+
+            for axis in reversed(tile.axes[1:]):
+                remaining, axis_reg = divmod_64(remaining, axis.extent.as_static())
+                self.regs.bind(axis.name, axis_reg)
+            if tile.axes:
+                self.regs.bind(tile.axes[0].name, remaining)
+
+        with self.regs.scope():
+            bind_axes()
+            self.lower_body(tile.body)
 
     def prologue(self) -> None:
         #  load and convert params addresses
