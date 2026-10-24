@@ -265,8 +265,21 @@ class KernelLowerer:
 
     def lower_binary(self, op: str, lhs: Register, rhs: Register) -> Register:
         lhs, rhs = self.coerce_binary(op, lhs, rhs)
+        comparisons = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq"}
+        if op in comparisons:
+            dst = self.regs.new("pred")
+            self.add_instr(f"setp.{comparisons[op]}.{lhs.type}", dst, lhs, rhs)
+            return dst
         floating = lhs.type.startswith("f")
+        suffix = lhs.type
         match op:
+            case "^":
+                opcode = "xor"
+                suffix = f"b{lhs.type[1:]}"
+            case "&&":
+                opcode = "and"
+            case "||":
+                opcode = "or"
             case "+":
                 opcode = "add"
             case "-":
@@ -282,7 +295,7 @@ class KernelLowerer:
             case _:
                 raise NotImplementedError(f"binary lowering: {op}")
         dst = self.regs.new(lhs.type)
-        self.add_instr(f"{opcode}.{lhs.type}", dst, lhs, rhs)
+        self.add_instr(f"{opcode}.{suffix}", dst, lhs, rhs)
         return dst
 
     def lower_literal(self, value: int | float | bool, dtype: str) -> Register:  # noqa: PYI041
