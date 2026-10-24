@@ -190,7 +190,7 @@ class KernelLowerer:
 
     @staticmethod
     def numeric_type(dtype: PtxRegisterType) -> PtxRegisterType:
-        # promotes smaller types for computation
+        # for smaller types use s32/f16 for computations
         if dtype in ("s16", "u8", "u16", "pred"):
             return "s32"
         if dtype in ("s32", "s64", "u32", "u64", "f32", "f64"):
@@ -200,6 +200,7 @@ class KernelLowerer:
         raise TypeError(f"unsupported scalar type: {dtype}")
 
     def coerce(self, reg: Register, dtype: PtxRegisterType) -> Register:
+        # promote regtype to dtype
         if reg.type == dtype:
             return reg
         if dtype == "pred":
