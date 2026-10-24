@@ -51,24 +51,33 @@ PtxRegisterType = Literal[
 ]
 
 
+@dataclass(frozen=True)
+class Register:
+    name: str
+    type: PtxRegisterType
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class RegisterStore:
     def __init__(self):
         self.reg_counts = {reg_type: 0 for reg_type in get_args(PtxRegisterType)}
-        self.bindings: dict[str, str] = {}
+        self.bindings: dict[str, Register] = {}
 
     @staticmethod
     def get_prefix(reg_type: PtxRegisterType) -> str:
         return f"{reg_type}_"
 
-    def bind(self, name: str, register: str):
+    def bind(self, name: str, register: Register):
         self.bindings[name] = register
 
-    def get_reg(self, name) -> str:
+    def get_reg(self, name: str) -> Register:
         return self.bindings[name]
 
-    def new(self, reg_type: PtxRegisterType, varname: str | None = None) -> str:
+    def new(self, reg_type: PtxRegisterType, varname: str | None = None) -> Register:
         count = self.reg_counts[reg_type]
-        register = f"%{self.get_prefix(reg_type)}{count}"
+        register = Register(f"%{self.get_prefix(reg_type)}{count}", reg_type)
         self.reg_counts[reg_type] += 1
         if varname is not None:
             self.bind(varname, register)
@@ -86,7 +95,7 @@ class RegisterStore:
 
 @dataclass
 class Predicate:
-    reg: str
+    reg: Register
     negated: bool = False
 
 
@@ -114,7 +123,7 @@ class PtxFunction:
     def add_instr(
         self,
         opcode: str,
-        *operands: str,
+        *operands: Register | str | int | float,
         predicate: Predicate | None = None,
     ) -> None:
         self.instructions.append(PtxInstr(opcode, operands, predicate))
@@ -139,6 +148,13 @@ class PtxCodegenCtx:
     ir: Graph
 
 
+@dataclass
+class KernelRegisters:
+    gid: Register
+    warp: Register
+    lane: Register
+
+
 class KernelLowerer:
     def __init__(self, graph, params: list[FuncParam], ir_kernel: KernelOp):
         self.graph = graph
@@ -148,6 +164,7 @@ class KernelLowerer:
         self.regs = self.func.registers
         self.params = self.func.params
         self.add_instr = self.func.add_instr
+        self.internal: KernelRegisters
 
     def lower_strided_loop(self, loop: StridedLoop): ...
 
@@ -165,13 +182,13 @@ class KernelLowerer:
 
     def lower_tile(self, tile: Tile):
         pprint(tile)
-        gid = self.regs.get_reg("gid")
+        gid = self.internal.gid
         N = tile.n_elements
         outofbounds = self.regs.new("pred")
         self.add_instr("setp.ge.u64", outofbounds, gid, N)
         self.add_instr("ret", predicate=Predicate(reg=outofbounds))
 
-        def divmod_64(a, b) -> tuple[str, str]:
+        def divmod_64(a, b) -> tuple[Register, Register]:
             """Returns regs holding u64 quotient and remainder."""
             q = self.regs.new("u64")
             r = self.regs.new("u64")
@@ -215,9 +232,10 @@ class KernelLowerer:
         bid = self.regs.new("u32")
         bdim = self.regs.new("u32")
         tid64 = self.regs.new("u64")
-        gid = self.regs.new("u64", "gid")
-        warp = self.regs.new("u32", "warp")
-        lane = self.regs.new("u32", "lane")
+        gid = self.regs.new("u64")
+        warp = self.regs.new("u32")
+        lane = self.regs.new("u32")
+        self.internal = KernelRegisters(gid=gid, warp=warp, lane=lane)
 
         self.add_instr("mov.u32", tid, "%tid.x")
         self.add_instr("mov.u32", bid, "%ctaid.x")
