@@ -1,12 +1,14 @@
 import json
+import struct
 import sys
+import typing
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
-from typing import Literal, get_args
 
 from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.kernel.ir import (
     KernelOp,
     Smem,
@@ -16,7 +18,7 @@ from emmy.compiler.ir.kernel.ir import (
     WarpShuffle,
 )
 from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
-from emmy.compiler.ir.stmt.leaves import Accum
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
 
 
 def load_ir_graph(ir_path: Path) -> tuple[Graph, dict]:
@@ -29,7 +31,7 @@ def load_ir_graph(ir_path: Path) -> tuple[Graph, dict]:
     return g, meta
 
 
-PtxRegisterType = Literal[
+PtxRegisterType = typing.Literal[
     "s8",
     "s16",
     "s32",
@@ -62,7 +64,7 @@ class Register:
 
 class RegisterStore:
     def __init__(self):
-        self.reg_counts = {reg_type: 0 for reg_type in get_args(PtxRegisterType)}
+        self.reg_counts = {reg_type: 0 for reg_type in typing.get_args(PtxRegisterType)}
         self.bindings: dict[str, Register] = {}
 
     @staticmethod
@@ -133,7 +135,7 @@ class PtxFunction:
 class PtxHeader:
     version: str = "8.0"
     target: str = "sm_89"
-    address_size: Literal[32, 64] = 64
+    address_size: typing.Literal[32, 64] = 64
 
 
 @dataclass
@@ -179,6 +181,73 @@ class KernelLowerer:
     def lower_sync(self, sync: Sync): ...
 
     def lower_tree_halve(self, tree_halve: TreeHalve): ...
+
+    def lower_load(self, load: Load):
+        ...
+
+    def lower_assign(self, assign: Assign):
+        ...
+
+    def lower_write(self, write: Write):
+        ...
+
+    def coerce_pair(self, a: Register, b: Register) -> tuple[Register, Register]:
+        ...
+
+
+
+    def lower_binary(self, op: str, lhs: Register, rhs: Register) -> Register:
+        lhs, rhs = self.coerce_pair(lhs, rhs)
+
+    def lower_literal(self, value: int | float | bool, dtype: str) -> Register:  # noqa: PYI041
+        def ptx_f32_literal(val):
+            packed = struct.pack('>f', val)
+            hex_digits = ''.join(f'{b:02x}' for b in packed)
+            return f"0f{hex_digits}"
+
+        if isinstance(value, bool):
+            dtype = "bool"
+        match dtype:
+            case "bool":
+                reg = self.regs.new("pred")
+                opcode = "setp.eq.s32" if value else "setp.ne.s32"
+                self.add_instr(opcode, reg, 0, 0)
+            case "float":
+                reg = self.regs.new("f32")
+                self.add_instr("mov.f32", reg, ptx_f32_literal(value))
+            case "int":
+                regtype = "s32" if -(1 << 31) <= value < (1 << 31) else "s64"
+                reg = self.regs.new(regtype)
+                self.add_instr(f"mov.{regtype}", reg, value)
+        return reg
+
+    def lower_expr(self, expr: Expr) -> Register:
+        match expr:
+            case Var(name=name):
+                return self.regs.get_reg(name)
+            
+            case Literal(value=value, dtype=dtype):
+                return self.lower_literal(value, dtype)
+            
+            case BinaryExpr(op=op, left=left, right=right):
+                lhs = self.lower_expr(left)
+                rhs = self.lower_expr(right)
+                return self.lower_binary(op, lhs, rhs)
+            
+            case TernaryExpr(cond=cond, if_true=a, if_false=b):
+                pred = self.as_pred(self.lower_expr(cond))
+                lhs = self.lower_expr(a)
+                rhs = self.lower_expr(b)
+                lhs, rhs = self.coerce_pair(lhs, rhs)
+                dst = self.regs.new(lhs.type)
+                self.add_instr(
+                    f"selp.{lhs.type}", dst, lhs, rhs, pred
+                )
+                return dst
+            case _:
+                raise NotImplementedError(
+                    f"unsupported expression: {type(expr).__name__}"
+                )
 
     def lower_tile(self, tile: Tile):
         pprint(tile)
