@@ -265,7 +265,25 @@ class KernelLowerer:
 
     def lower_binary(self, op: str, lhs: Register, rhs: Register) -> Register:
         lhs, rhs = self.coerce_binary(op, lhs, rhs)
-        # TODO implement binary lowering
+        floating = lhs.type.startswith("f")
+        match op:
+            case "+":
+                opcode = "add"
+            case "-":
+                opcode = "sub"
+            case "*":
+                opcode = "mul" if floating else "mul.lo"
+            case "/":
+                opcode = "div.rn" if floating else "div"
+            case "//" if not floating:
+                opcode = "div"
+            case "%" if not floating:
+                opcode = "rem"
+            case _:
+                raise NotImplementedError(f"binary lowering: {op}")
+        dst = self.regs.new(lhs.type)
+        self.add_instr(f"{opcode}.{lhs.type}", dst, lhs, rhs)
+        return dst
 
     def lower_literal(self, value: int | float | bool, dtype: str) -> Register:  # noqa: PYI041
         def ptx_f32_literal(val):
