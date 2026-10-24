@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
 
+from emmy.compiler.dtype import DataType
 from emmy.compiler.dtype import get as get_dtype
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
@@ -199,29 +200,40 @@ class KernelLowerer:
             index = flat
         return index
 
-    def lower_load(self, load: Load):
-        shared = self.ir_kernel.smem_buffers.get(load.input)
+    def buffer_address(
+        self, name: str, indices: tuple[Expr, ...], dtype: DataType | None = None
+    ) -> tuple[Register, str, DataType]:
+        # calculate byte address and resolve the buffer's memory space and dtype
+        shared = self.ir_kernel.smem_buffers.get(name)
         if shared is not None:
             shape = shared.extents
-            dtype = load.dtype or get_dtype(
+            dtype = dtype or get_dtype(
                 {"float": "f32", "__half": "f16", "double": "f64"}[shared.dtype]
             )
             base_address = self.regs.new("u64")
             self.add_instr("mov.u64", base_address, shared.name)
             memory_space = "shared"
         else:
-            flatten_needed = len(load.index) > 1
-            if flatten_needed:
-                shape = tuple(
-                    d.as_static() for d in self.graph.buffer(load.input).shape
-                )
-            else:
-                shape = ()
-            dtype = load.dtype
-            base_address = self.regs.get_reg(load.input)
+            buffer = (
+                self.graph.buffer(name) if dtype is None or len(indices) > 1 else None
+            )
+            dtype = dtype or buffer.dtype
+            shape = (
+                tuple(d.as_static() for d in buffer.shape) if len(indices) > 1 else ()
+            )
+            base_address = self.regs.get_reg(name)
             memory_space = "global"
+        element_index = self.lower_index(indices, shape)
+        address = self.regs.new("u64")
+        self.add_instr("mad.lo.u64", address, element_index, dtype.nbytes, base_address)
+        return address, memory_space, dtype
 
-        memory_type, register_type = {
+    @staticmethod
+    def memory_types(dtype: DataType) -> tuple[PtxRegisterType, PtxRegisterType]:
+        # tensor dtype -> PTX (memory, register) types
+        # memory_type: load/store element type and byte width
+        # register_type: register representation used for the value
+        return {
             "f16": ("b16", "f16"),
             "f32": ("f32", "f32"),
             "f64": ("f64", "f64"),
@@ -234,11 +246,13 @@ class KernelLowerer:
             "u64": ("u64", "u64"),
             "bool": ("u8", "s32"),
         }[dtype.name]
-        element_index = self.lower_index(load.index, shape)
-        address = self.regs.new("u64")
-        self.add_instr("mad.lo.u64", address, element_index, dtype.nbytes, base_address)
 
-        # TODO: future optimization: group consecutive loads into vector instructions
+    def lower_load(self, load: Load):
+        address, memory_space, dtype = self.buffer_address(
+            load.input, load.index, load.dtype
+        )
+        memory_type, register_type = self.memory_types(dtype)
+        # TODO: group consecutive loads into vector instructions
         for element, name in enumerate(load.names):
             register = self.regs.new(register_type)
             byte_offset = element * dtype.nbytes
@@ -253,7 +267,25 @@ class KernelLowerer:
 
     def lower_assign(self, assign: Assign): ...
 
-    def lower_write(self, write: Write): ...
+    def lower_write(self, write: Write):
+        address, memory_space, dtype = self.buffer_address(write.output, write.index)
+        memory_type, register_type = self.memory_types(dtype)
+        for element, name in enumerate(write.values):
+            register = self.regs.get_reg(name)
+            if dtype.name == "bool":
+                register = self.as_pred(register)
+            register = self.coerce(register, register_type)
+            byte_offset = element * dtype.nbytes
+            destination = f"[{address} + {byte_offset}]"
+            if write.atomic:
+                atomic_type = "u64" if memory_type == "s64" else memory_type
+                self.add_instr(
+                    f"red.{memory_space}.add.{atomic_type}", destination, register
+                )
+            else:
+                self.add_instr(
+                    f"st.{memory_space}.{memory_type}", destination, register
+                )
 
     @staticmethod
     def numeric_type(dtype: PtxRegisterType) -> PtxRegisterType:
@@ -499,6 +531,8 @@ class KernelLowerer:
                 self.lower_tree_halve(stmt)
             case Load():
                 self.lower_load(stmt)
+            case Write():
+                self.lower_write(stmt)
             case _:
                 raise NotImplementedError(
                     f"{self.ir_kernel.name}: unsupported {type(stmt).__name__}"
