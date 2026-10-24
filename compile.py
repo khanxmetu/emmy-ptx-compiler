@@ -346,27 +346,20 @@ class KernelLowerer:
         self.add_instr("setp.ge.u64", outofbounds, gid, N)
         self.add_instr("ret", predicate=Predicate(reg=outofbounds))
 
-        def divmod_64(a, b) -> tuple[Register, Register]:
-            q = self.regs.new("u64")
-            r = self.regs.new("u64")
-            prod = self.regs.new("u64")
-
-            self.add_instr("div.u64", q, a, b)
-            self.add_instr("mul.lo.u64", prod, q, b)
-            self.add_instr("sub.u64", r, a, prod)
-            return q, r
-
         def bind_axes():
-            # decode gid with the innermost axis varying fastest
-            # TODO: use u32 for small grids and shifts/masks for power-of-two extents
-            remaining = self.regs.new("u64")
-            self.add_instr("mov.b64", remaining, gid)
-
-            for axis in reversed(tile.axes[1:]):
-                remaining, axis_reg = divmod_64(remaining, axis.extent.as_static())
+            dim_prod = 1
+            for i, axis in enumerate(reversed(tile.axes)):
+                extent = axis.extent.as_static()
+                axis_reg = gid
+                if dim_prod > 1:
+                    axis_reg = self.regs.new("u64")
+                    self.add_instr("div.u64", axis_reg, gid, dim_prod)
+                if i != len(tile.axes) - 1:
+                    coord = self.regs.new("u64")
+                    self.add_instr("rem.u64", coord, axis_reg, extent)
+                    axis_reg = coord
                 self.regs.bind(axis.name, axis_reg)
-            if tile.axes:
-                self.regs.bind(tile.axes[0].name, remaining)
+                dim_prod *= extent
 
         with self.regs.scope():
             bind_axes()
