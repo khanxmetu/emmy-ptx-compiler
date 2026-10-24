@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
 
-from emmy.compiler.graph import Graph, Node
+from emmy.compiler.graph import Graph
 from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.kernel.ir import (
     KernelOp,
@@ -125,7 +125,7 @@ class PtxFunction:
     def add_instr(
         self,
         opcode: str,
-        *operands: Register | str | int | float,
+        *operands: Register | str | float,
         predicate: Predicate | None = None,
     ) -> None:
         self.instructions.append(PtxInstr(opcode, operands, predicate))
@@ -182,27 +182,95 @@ class KernelLowerer:
 
     def lower_tree_halve(self, tree_halve: TreeHalve): ...
 
-    def lower_load(self, load: Load):
-        ...
+    def lower_load(self, load: Load): ...
 
-    def lower_assign(self, assign: Assign):
-        ...
+    def lower_assign(self, assign: Assign): ...
 
-    def lower_write(self, write: Write):
-        ...
+    def lower_write(self, write: Write): ...
+
+    @staticmethod
+    def numeric_type(dtype: PtxRegisterType) -> PtxRegisterType:
+        # promotes smaller types for computation
+        if dtype in ("s16", "u8", "u16", "pred"):
+            return "s32"
+        if dtype in ("s32", "s64", "u32", "u64", "f32", "f64"):
+            return dtype
+        if dtype == "f16":
+            return "f32"
+        raise TypeError(f"unsupported scalar type: {dtype}")
+
+    def coerce(self, reg: Register, dtype: PtxRegisterType) -> Register:
+        if reg.type == dtype:
+            return reg
+        if dtype == "pred":
+            return self.as_pred(reg)
+        if reg.type == "pred":
+            dst = self.regs.new("s32")
+            self.add_instr("selp.s32", dst, 1, 0, reg)
+            return self.coerce(dst, dtype)
+        dst = self.regs.new(dtype)
+        src_float, dst_float = reg.type.startswith("f"), dtype.startswith("f")
+        rounding = ""
+        if src_float and not dst_float:
+            rounding = ".rzi"  # truncate toward zero
+        elif dst_float:
+            if not src_float:
+                rounding = ".rn"  # integer to float: nearest-even
+            elif int(dtype[1:]) < int(reg.type[1:]):
+                rounding = ".rn"  # float narrowing: nearest-even
+        self.add_instr(f"cvt{rounding}.{dtype}.{reg.type}", dst, reg)
+        return dst
+
+    def as_pred(self, reg: Register) -> Register:
+        if reg.type == "pred":
+            return reg
+        reg = self.coerce(reg, self.numeric_type(reg.type))
+        dst = self.regs.new("pred")
+        # unordered comparison keeps NaN truthy
+        cmp = "neu" if reg.type.startswith("f") else "ne"
+        zero = (
+            "0f00000000"
+            if reg.type == "f32"
+            else ("0d0000000000000000" if reg.type == "f64" else 0)
+        )
+        self.add_instr(f"setp.{cmp}.{reg.type}", dst, reg, zero)
+        return dst
 
     def coerce_pair(self, a: Register, b: Register) -> tuple[Register, Register]:
-        ...
+        at, bt = self.numeric_type(a.type), self.numeric_type(b.type)
+        if "f64" in (at, bt):
+            dtype = "f64"
+        elif "f32" in (at, bt):
+            dtype = "f32"
+        else:
+            width = max(int(at[1:]), int(bt[1:]))
+            unsigned = f"u{width}" in (at, bt)
+            # according to c promotion rules when equal rank, convert both unsigned
+            dtype = f"{'u' if unsigned else 's'}{width}"
+        return self.coerce(a, dtype), self.coerce(b, dtype)
 
-
+    def coerce_binary(
+        self, op: str, lhs: Register, rhs: Register
+    ) -> tuple[Register, Register]:
+        if op in ("&&", "||"):
+            return self.as_pred(lhs), self.as_pred(rhs)
+        elif op in ("<<", ">>"):
+            return (
+                self.coerce(lhs, self.numeric_type(lhs.type)),
+                # shift count type is independent of the value
+                self.coerce(rhs, "u32"),
+            )
+        else:
+            return self.coerce_pair(lhs, rhs)
 
     def lower_binary(self, op: str, lhs: Register, rhs: Register) -> Register:
-        lhs, rhs = self.coerce_pair(lhs, rhs)
+        lhs, rhs = self.coerce_binary(op, lhs, rhs)
+        # TODO implement binary lowering
 
     def lower_literal(self, value: int | float | bool, dtype: str) -> Register:  # noqa: PYI041
         def ptx_f32_literal(val):
-            packed = struct.pack('>f', val)
-            hex_digits = ''.join(f'{b:02x}' for b in packed)
+            packed = struct.pack(">f", val)
+            hex_digits = "".join(f"{b:02x}" for b in packed)
             return f"0f{hex_digits}"
 
         if isinstance(value, bool):
@@ -225,24 +293,27 @@ class KernelLowerer:
         match expr:
             case Var(name=name):
                 return self.regs.get_reg(name)
-            
+
             case Literal(value=value, dtype=dtype):
                 return self.lower_literal(value, dtype)
-            
+
             case BinaryExpr(op=op, left=left, right=right):
                 lhs = self.lower_expr(left)
                 rhs = self.lower_expr(right)
                 return self.lower_binary(op, lhs, rhs)
-            
+
             case TernaryExpr(cond=cond, if_true=a, if_false=b):
                 pred = self.as_pred(self.lower_expr(cond))
                 lhs = self.lower_expr(a)
                 rhs = self.lower_expr(b)
-                lhs, rhs = self.coerce_pair(lhs, rhs)
-                dst = self.regs.new(lhs.type)
-                self.add_instr(
-                    f"selp.{lhs.type}", dst, lhs, rhs, pred
-                )
+                if lhs.type == rhs.type == "pred":
+                    dst = self.regs.new("pred")
+                    self.add_instr("mov.pred", dst, rhs)
+                    self.add_instr("mov.pred", dst, lhs, predicate=Predicate(pred))
+                else:
+                    lhs, rhs = self.coerce_pair(lhs, rhs)
+                    dst = self.regs.new(lhs.type)
+                    self.add_instr(f"selp.{lhs.type}", dst, lhs, rhs, pred)
                 return dst
             case _:
                 raise NotImplementedError(
@@ -258,7 +329,6 @@ class KernelLowerer:
         self.add_instr("ret", predicate=Predicate(reg=outofbounds))
 
         def divmod_64(a, b) -> tuple[Register, Register]:
-            """Returns regs holding u64 quotient and remainder."""
             q = self.regs.new("u64")
             r = self.regs.new("u64")
             prod = self.regs.new("u64")
@@ -269,9 +339,8 @@ class KernelLowerer:
             return q, r
 
         def bind_axes():
-            # Decode per axis indices from gid, innermost axis is fastest moving
-            # e.g axis: (i, j, k) => gid = k + Dk*(j + Dj*i)
-            # TODO: optimize: use u32 if gid<2^32. try optimized instructions when axis.extent is power of two.
+            # decode gid with the innermost axis varying fastest
+            # TODO: use u32 for small grids and shifts/masks for power-of-two extents
             remaining = self.regs.new("u64")
             self.add_instr("mov.b64", remaining, gid)
 
@@ -286,7 +355,6 @@ class KernelLowerer:
             self.lower_body(tile.body)
 
     def prologue(self) -> None:
-        #  load and convert params addresses
         for param in self.params:
             addr_reg = self.regs.new("b64", param.name)
             self.add_instr("ld.param.u64", addr_reg, "[" + param.name + "]")
@@ -295,8 +363,8 @@ class KernelLowerer:
             gaddr_reg = self.regs.new("b64", param.name)
             self.add_instr("cvta.to.global.u64", gaddr_reg, addr_reg)
 
-        # calculate gid, kernel ir always launches with blockDim(x, 1, 1) and gridDim(x, 1, 1)
-        # TODO: optimize for when gid < 2^32
+        # kernel launches use only the x dimension
+        # TODO: use u32 when gid < 2^32
         tid = self.regs.new("u32")
         bid = self.regs.new("u32")
         bdim = self.regs.new("u32")
@@ -422,9 +490,10 @@ class PtxPrinter:
         return "\n".join(self.module(module))
 
 
-ir_path = Path(sys.argv[1])
-ir, meta = load_ir_graph(ir_path)
-codegen = PtxCodegen()
-ptx = codegen.generate(ir, meta)
-printer = PtxPrinter()
-print(printer.emit(ptx))
+if __name__ == "__main__":
+    ir_path = Path(sys.argv[1])
+    ir, meta = load_ir_graph(ir_path)
+    codegen = PtxCodegen()
+    ptx = codegen.generate(ir, meta)
+    printer = PtxPrinter()
+    print(printer.emit(ptx))
