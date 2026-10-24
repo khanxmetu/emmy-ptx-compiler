@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pprint
 
+from emmy.compiler.dtype import get as get_dtype
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.kernel.ir import (
@@ -158,7 +159,7 @@ class KernelRegisters:
 
 
 class KernelLowerer:
-    def __init__(self, graph, params: list[FuncParam], ir_kernel: KernelOp):
+    def __init__(self, graph: Graph, params: list[FuncParam], ir_kernel: KernelOp):
         self.graph = graph
         self.ir_kernel = ir_kernel
         self.func = PtxFunction(ir_kernel.name, params)
@@ -182,7 +183,73 @@ class KernelLowerer:
 
     def lower_tree_halve(self, tree_halve: TreeHalve): ...
 
-    def lower_load(self, load: Load): ...
+    def lower_index(
+        self, indices: tuple[Expr, ...], shape: tuple[int, ...]
+    ) -> Register:
+        if not indices:
+            index = self.regs.new("u64")
+            self.add_instr("mov.u64", index, 0)
+            return index
+        index = self.coerce(self.lower_expr(indices[0]), "u64")
+        # flatten into row major index
+        for d, expr in enumerate(indices[1:], 1):
+            coord = self.coerce(self.lower_expr(expr), "u64")
+            flat = self.regs.new("u64")
+            self.add_instr("mad.lo.u64", flat, index, shape[d], coord)
+            index = flat
+        return index
+
+    def lower_load(self, load: Load):
+        shared = self.ir_kernel.smem_buffers.get(load.input)
+        if shared is not None:
+            shape = shared.extents
+            dtype = load.dtype or get_dtype(
+                {"float": "f32", "__half": "f16", "double": "f64"}[shared.dtype]
+            )
+            base_address = self.regs.new("u64")
+            self.add_instr("mov.u64", base_address, shared.name)
+            memory_space = "shared"
+        else:
+            flatten_needed = len(load.index) > 1
+            if flatten_needed:
+                shape = tuple(
+                    d.as_static() for d in self.graph.buffer(load.input).shape
+                )
+            else:
+                shape = ()
+            dtype = load.dtype
+            base_address = self.regs.get_reg(load.input)
+            memory_space = "global"
+
+        memory_type, register_type = {
+            "f16": ("b16", "f16"),
+            "f32": ("f32", "f32"),
+            "f64": ("f64", "f64"),
+            "i16": ("s16", "s32"),
+            "i32": ("s32", "s32"),
+            "i64": ("s64", "s64"),
+            "u8": ("u8", "s32"),
+            "u16": ("u16", "s32"),
+            "u32": ("u32", "u32"),
+            "u64": ("u64", "u64"),
+            "bool": ("u8", "s32"),
+        }[dtype.name]
+        element_index = self.lower_index(load.index, shape)
+        address = self.regs.new("u64")
+        self.add_instr("mad.lo.u64", address, element_index, dtype.nbytes, base_address)
+
+        # TODO: future optimization: group consecutive loads into vector instructions
+        for element, name in enumerate(load.names):
+            register = self.regs.new(register_type)
+            byte_offset = element * dtype.nbytes
+            self.add_instr(
+                f"ld.{memory_space}.{memory_type}",
+                register,
+                f"[{address} + {byte_offset}]",
+            )
+            if dtype.name == "bool":
+                register = self.as_pred(register)
+            self.regs.bind(name, register)
 
     def lower_assign(self, assign: Assign): ...
 
@@ -430,6 +497,8 @@ class KernelLowerer:
                 self.lower_sync(stmt)
             case TreeHalve():
                 self.lower_tree_halve(stmt)
+            case Load():
+                self.lower_load(stmt)
             case _:
                 raise NotImplementedError(
                     f"{self.ir_kernel.name}: unsupported {type(stmt).__name__}"
