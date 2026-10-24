@@ -1,4 +1,5 @@
 import json
+import math
 import struct
 import sys
 import typing
@@ -21,6 +22,10 @@ from emmy.compiler.ir.kernel.ir import (
 )
 from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
 from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+
+
+def ptx_f32_literal(val: float) -> str:
+    return "0f" + struct.pack(">f", val).hex()
 
 
 def load_ir_graph(ir_path: Path) -> tuple[Graph, dict]:
@@ -210,9 +215,9 @@ class KernelLowerer:
             dtype = dtype or get_dtype(
                 {"float": "f32", "__half": "f16", "double": "f64"}[shared.dtype]
             )
-            base_address = self.regs.new("u64")
-            self.add_instr("mov.u64", base_address, shared.name)
-            memory_space = "shared"
+            base = self.regs.new("u64")
+            self.add_instr("mov.u64", base, shared.name)
+            space = "shared"
         else:
             buffer = (
                 self.graph.buffer(name) if dtype is None or len(indices) > 1 else None
@@ -221,18 +226,18 @@ class KernelLowerer:
             shape = (
                 tuple(d.as_static() for d in buffer.shape) if len(indices) > 1 else ()
             )
-            base_address = self.regs.get_reg(name)
-            memory_space = "global"
-        element_index = self.lower_index(indices, shape)
-        address = self.regs.new("u64")
-        self.add_instr("mad.lo.u64", address, element_index, dtype.nbytes, base_address)
-        return address, memory_space, dtype
+            base = self.regs.get_reg(name)
+            space = "global"
+        index = self.lower_index(indices, shape)
+        addr = self.regs.new("u64")
+        self.add_instr("mad.lo.u64", addr, index, dtype.nbytes, base)
+        return addr, space, dtype
 
     @staticmethod
     def memory_types(dtype: DataType) -> tuple[PtxRegisterType, PtxRegisterType]:
         # tensor dtype -> PTX (memory, register) types
-        # memory_type: load/store element type and byte width
-        # register_type: register representation used for the value
+        # mem_type: load/store element type and byte width
+        # reg_type: register representation used for the value
         return {
             "f16": ("b16", "f16"),
             "f32": ("f32", "f32"),
@@ -248,48 +253,97 @@ class KernelLowerer:
         }[dtype.name]
 
     def lower_load(self, load: Load):
-        address, memory_space, dtype = self.buffer_address(
-            load.input, load.index, load.dtype
-        )
-        memory_type, register_type = self.memory_types(dtype)
+        addr, space, dtype = self.buffer_address(load.input, load.index, load.dtype)
+        mem_type, reg_type = self.memory_types(dtype)
         # TODO: group consecutive loads into vector instructions
-        for element, name in enumerate(load.names):
-            register = self.regs.new(register_type)
-            byte_offset = element * dtype.nbytes
+        for i, name in enumerate(load.names):
+            reg = self.regs.new(reg_type)
+            offset = i * dtype.nbytes
             self.add_instr(
-                f"ld.{memory_space}.{memory_type}",
-                register,
-                f"[{address} + {byte_offset}]",
+                f"ld.{space}.{mem_type}",
+                reg,
+                f"[{addr} + {offset}]",
             )
             if dtype.name == "bool":
-                register = self.as_pred(register)
-            self.regs.bind(name, register)
+                reg = self.as_pred(reg)
+            self.regs.bind(name, reg)
 
-    def lower_assign(self, assign: Assign): ...
+    def lower_assign(self, assign: Assign):
+        
+        # map emmy names to ptx types; unsigned and float names already match
+        dst_type = {
+            "i16": "s16",
+            "i32": "s32",
+            "i64": "s64",
+            "bool": "pred",
+        }.get(assign.dtype.name, assign.dtype.name)
+        args = [self.regs.get_reg(name) for name in assign.args]
+        if assign.op.name == "copy":
+            dst = self.coerce(args[0], dst_type)
+        else:
+            dst = self.lower_elementwise(assign.op.name, args, dst_type)
+            dst = self.coerce(dst, dst_type)
+        self.regs.bind(assign.name, dst)
+
+    def lower_elementwise(
+        self, op: str, args: list[Register], dst_type: PtxRegisterType
+    ) -> Register:
+        compute_type = "f32"
+        if op in ("add", "subtract", "multiply") and dst_type.startswith(("s", "u")):
+            compute_type = self.numeric_type(dst_type)
+        elif (
+            op == "add" and dst_type == "f16" and all(reg.type == "f16" for reg in args)
+        ):
+            compute_type = "f16"
+
+        args = [self.coerce(reg, compute_type) for reg in args]
+        dst = self.regs.new(compute_type)
+        match op:
+            case "add" | "subtract" | "multiply" | "divide" | "maximum":
+                opcode = {
+                    "add": "add",
+                    "subtract": "sub",
+                    "multiply": "mul" if compute_type.startswith("f") else "mul.lo",
+                    "divide": "div.rn",
+                    "maximum": "max",
+                }[op]
+                self.add_instr(f"{opcode}.{compute_type}", dst, *args)
+            case "exp":
+                scaled = self.regs.new("f32")
+                # exp(x) = 2 ** (x * log2(e))
+                self.add_instr(
+                    "mul.f32", scaled, args[0], ptx_f32_literal(math.log2(math.e))
+                )
+                self.add_instr("ex2.approx.f32", dst, scaled)
+            case "reciprocal":
+                self.add_instr("rcp.rn.f32", dst, args[0])
+            case "relu":
+                self.add_instr("max.f32", dst, "0f00000000", args[0])
+            case "sqrt":
+                self.add_instr("sqrt.rn.f32", dst, args[0])
+            case _:
+                raise NotImplementedError(f"assign lowering: {op}")
+        return dst
 
     def lower_write(self, write: Write):
-        address, memory_space, dtype = self.buffer_address(write.output, write.index)
-        memory_type, register_type = self.memory_types(dtype)
-        for element, name in enumerate(write.values):
-            register = self.regs.get_reg(name)
+        addr, space, dtype = self.buffer_address(write.output, write.index)
+        mem_type, reg_type = self.memory_types(dtype)
+        for i, name in enumerate(write.values):
+            reg = self.regs.get_reg(name)
             if dtype.name == "bool":
-                register = self.as_pred(register)
-            register = self.coerce(register, register_type)
-            byte_offset = element * dtype.nbytes
-            destination = f"[{address} + {byte_offset}]"
+                reg = self.as_pred(reg)
+            reg = self.coerce(reg, reg_type)
+            offset = i * dtype.nbytes
+            dst = f"[{addr} + {offset}]"
             if write.atomic:
-                atomic_type = "u64" if memory_type == "s64" else memory_type
-                self.add_instr(
-                    f"red.{memory_space}.add.{atomic_type}", destination, register
-                )
+                atomic_type = "u64" if mem_type == "s64" else mem_type
+                self.add_instr(f"red.{space}.add.{atomic_type}", dst, reg)
             else:
-                self.add_instr(
-                    f"st.{memory_space}.{memory_type}", destination, register
-                )
+                self.add_instr(f"st.{space}.{mem_type}", dst, reg)
 
     @staticmethod
     def numeric_type(dtype: PtxRegisterType) -> PtxRegisterType:
-        # for smaller types use s32/f16 for computations
+        # for smaller types use s32/f32 for computations
         if dtype in ("s16", "u8", "u16", "pred"):
             return "s32"
         if dtype in ("s32", "s64", "u32", "u64", "f32", "f64"):
@@ -308,7 +362,7 @@ class KernelLowerer:
             dst = self.regs.new("s32")
             self.add_instr("selp.s32", dst, 1, 0, reg)
             return self.coerce(dst, dtype)
-        dst = self.regs.new(dtype)
+        dst = self.regs.new("s32" if dtype == "u8" else dtype)
         src_float, dst_float = reg.type.startswith("f"), dtype.startswith("f")
         rounding = ""
         if src_float and not dst_float:
@@ -399,11 +453,6 @@ class KernelLowerer:
         return dst
 
     def lower_literal(self, value: int | float | bool, dtype: str) -> Register:  # noqa: PYI041
-        def ptx_f32_literal(val):
-            packed = struct.pack(">f", val)
-            hex_digits = "".join(f"{b:02x}" for b in packed)
-            return f"0f{hex_digits}"
-
         if isinstance(value, bool):
             dtype = "bool"
         match dtype:
@@ -452,7 +501,7 @@ class KernelLowerer:
                 )
 
     def lower_tile(self, tile: Tile):
-        pprint(tile)
+        # pprint(tile)
         gid = self.internal.gid
         N = tile.n_elements
         outofbounds = self.regs.new("pred")
@@ -533,6 +582,8 @@ class KernelLowerer:
                 self.lower_load(stmt)
             case Write():
                 self.lower_write(stmt)
+            case Assign():
+                self.lower_assign(stmt)
             case _:
                 raise NotImplementedError(
                     f"{self.ir_kernel.name}: unsupported {type(stmt).__name__}"
