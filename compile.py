@@ -2,10 +2,20 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from pprint import pprint
 from typing import Literal, get_args
 
 from emmy.compiler.graph import Graph, Node
-from emmy.compiler.ir.kernel.ir import KernelOp
+from emmy.compiler.ir.kernel.ir import (
+    KernelOp,
+    Smem,
+    Sync,
+    Tile,
+    TreeHalve,
+    WarpShuffle,
+)
+from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
+from emmy.compiler.ir.stmt.leaves import Accum
 
 
 def load_ir_graph(ir_path: Path) -> tuple[Graph, dict]:
@@ -49,19 +59,19 @@ class RegisterStore:
     def get_prefix(reg_type: PtxRegisterType) -> str:
         return f"{reg_type}_"
 
-    def bind(self, varname: str, regname: str):
-        self.bindings[varname] = regname
+    def bind(self, name: str, register: str):
+        self.bindings[name] = register
 
-    def get_reg(self, varname) -> str:
-        return self.bindings[varname]
+    def get_reg(self, name) -> str:
+        return self.bindings[name]
 
     def new(self, reg_type: PtxRegisterType, varname: str | None = None) -> str:
         count = self.reg_counts[reg_type]
-        regname = f"%{self.get_prefix(reg_type)}{count}"
+        register = f"%{self.get_prefix(reg_type)}{count}"
         self.reg_counts[reg_type] += 1
         if varname is not None:
-            self.bind(varname, regname)
-        return regname
+            self.bind(varname, register)
+        return register
 
 
 @dataclass
@@ -119,73 +129,123 @@ class PtxCodegenCtx:
     ir: Graph
 
 
+class KernelLowerer:
+    def __init__(self, graph, params: list[FuncParam], ir_kernel: KernelOp):
+        self.graph = graph
+        self.ir_kernel = ir_kernel
+        self.func = PtxFunction(ir_kernel.name, params)
+
+        self.regs = self.func.registers
+        self.params = self.func.params
+        self.add_instr = self.func.add_instr
+
+    def lower_strided_loop(self, loop: StridedLoop): ...
+
+    def lower_accum(self, accum: Accum): ...
+
+    def lower_warp_shuffle(self, warp: WarpShuffle): ...
+
+    def lower_smem(self, smem: Smem): ...
+
+    def lower_cond(self, cond: Cond): ...
+
+    def lower_sync(self, sync: Sync): ...
+
+    def lower_tree_halve(self, tree_halve: TreeHalve): ...
+
+    def lower_tile(self, tile: Tile):
+        pprint(tile)
+        gid = self.regs.get_reg("gid")
+        N = tile.n_elements
+        outofbounds = self.regs.new("pred")
+        self.add_instr("setp.ge.u64", outofbounds, gid, N)
+        self.add_instr("ret", predicate=Predicate(reg=outofbounds))
+
+    def prologue(self) -> None:
+        #  load and convert params addresses
+        for param in self.params:
+            addr_reg = self.regs.new("b64", param.name)
+            self.add_instr("ld.param.u64", addr_reg, "[" + param.name + "]")
+        for param in self.params:
+            addr_reg = self.regs.get_reg(param.name)
+            gaddr_reg = self.regs.new("b64", param.name)
+            self.add_instr("cvta.to.global.u64", gaddr_reg, addr_reg)
+
+        # calculate gid, kernel ir always launches with blockDim(x, 1, 1) and gridDim(x, 1, 1)
+        # TODO: optimize for when gid < 2^32
+        tid = self.regs.new("u32")
+        bid = self.regs.new("u32")
+        bdim = self.regs.new("u32")
+        tid64 = self.regs.new("u64")
+        gid = self.regs.new("u64", "gid")
+        warp = self.regs.new("u32", "warp")
+        lane = self.regs.new("u32", "lane")
+
+        self.add_instr("mov.u32", tid, "%tid.x")
+        self.add_instr("mov.u32", bid, "%ctaid.x")
+        self.add_instr("mov.u32", bdim, "%ntid.x")
+        self.add_instr("cvt.u64.u32", tid64, tid)
+        self.add_instr("mad.wide.u32", gid, bdim, bid, tid64)
+
+        self.add_instr("shr.u32", warp, tid, 5)
+        self.add_instr("and.b32", lane, tid, 31)
+
+    def lower_body(self, body) -> None:
+        for child in body:
+            self.lower_stmt(child)
+
+    def lower_stmt(self, stmt) -> None:
+        match stmt:
+            case Tile():
+                self.lower_tile(stmt)
+            case StridedLoop():
+                self.lower_strided_loop(stmt)
+            case Accum():
+                self.lower_accum(stmt)
+            case WarpShuffle():
+                self.lower_warp_shuffle(stmt)
+            case Smem():
+                self.lower_smem(stmt)
+            case Cond():
+                self.lower_cond(stmt)
+            case Sync():
+                self.lower_sync(stmt)
+            case TreeHalve():
+                self.lower_tree_halve(stmt)
+            case _:
+                raise NotImplementedError(
+                    f"{self.ir_kernel.name}: unsupported {type(stmt).__name__}"
+                )
+
+    def lower(self) -> PtxFunction:
+        self.prologue()
+        self.lower_body(self.ir_kernel.body)
+        self.add_instr("ret")
+        return self.func
+
+
 class PtxCodegen:
     def __init__(self):
         pass
 
-    def get_func_params(
-        self, node_id: str, codegen_ctx: PtxCodegenCtx
-    ) -> list[FuncParam]:
-        param_names = codegen_ctx.argnames[node_id]
+    def get_func_params(self, argnames: list[str], ir: Graph) -> list[FuncParam]:
         params = [
-            FuncParam(name, type="u64", pointee_type=codegen_ctx.ir.buffer(name).dtype)
-            for name in param_names
+            FuncParam(name, type="u64", pointee_type=ir.buffer(name).dtype)
+            for name in argnames
         ]
         return params
-
-    def kernel_prologue(
-        self, node_id: str, codegen_ctx: PtxCodegenCtx, ptx_kernel: PtxFunction
-    ) -> None:
-        params = self.get_func_params(node_id, codegen_ctx)
-        ptx_kernel.params = params
-        regs = ptx_kernel.registers
-        #  load and convert params addresses
-        for param in params:
-            addr_reg = regs.new("b64", param.name)
-            ptx_kernel.add_instr("ld.param.u64", addr_reg, "[" + param.name + "]")
-        for param in params:
-            addr_reg = regs.get_reg(param.name)
-            gaddr_reg = regs.new("b64", param.name)
-            ptx_kernel.add_instr("cvta.to.global.u64", gaddr_reg, addr_reg)
-
-        # calculate gid
-        # TODO: optimize for when gid < 2^32
-        tid = regs.new("u32")
-        bid = regs.new("u32")
-        bdim = regs.new("u32")
-        tid64 = regs.new("u64")
-        gid = regs.new("u64", "gid")
-        warp = regs.new("u32", "warp")
-        lane = regs.new("u32", "lane")
-
-        ptx_kernel.add_instr("mov.u32", tid, "%tid.x")
-        ptx_kernel.add_instr("mov.u32", bid, "%ctaid.x")
-        ptx_kernel.add_instr("mov.u32", bdim, "%ntid.x")
-        ptx_kernel.add_instr("cvt.u64.u32", tid64, tid)
-        ptx_kernel.add_instr("mad.wide.u32", gid, bdim, bid, tid64)
-
-        ptx_kernel.add_instr("shr.u32", warp, tid, 5)
-        ptx_kernel.add_instr("and.b32", lane, tid, 31)
-
-    def translate_kernel(
-        self, node_id: str, kernel: KernelOp, codegen_ctx: PtxCodegenCtx
-    ) -> PtxFunction:
-        ptx_kernel = PtxFunction(name=kernel.name)
-        self.kernel_prologue(node_id, codegen_ctx, ptx_kernel)
-
-        ptx_kernel.add_instr("ret")
-        return ptx_kernel
 
     def generate(self, ir: Graph, metadata: dict) -> PtxModule:
         argnames = {
             kernel["node"]: kernel["arg_order"] for kernel in metadata["kernels"]
         }
-        ctx = PtxCodegenCtx(argnames, ir)
         module = PtxModule()
         for node in ir.nodes.values():
             if isinstance(node.op, KernelOp):
-                kernel = self.translate_kernel(node.id, node.op, ctx)
-                module.kernels.append(kernel)
+                params = self.get_func_params(argnames[node.id], ir)
+                lowerer = KernelLowerer(ir, params, node.op)
+                ptx_kernel = lowerer.lower()
+                module.kernels.append(ptx_kernel)
         return module
 
 
