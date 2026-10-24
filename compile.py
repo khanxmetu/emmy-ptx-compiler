@@ -210,7 +210,13 @@ class PtxPrinter:
         ]
 
     def instruction(self, instr: PtxInstr) -> list[str]:
-        return f"{instr.opcode:25} {', '.join([str(op) for op in instr.operands])};"
+        prefix = ""
+        if instr.predicate is not None:
+            pred = instr.predicate
+            prefix = f"@{'!' if pred.negated else ''}{pred.reg} "
+
+        operands = ", ".join(str(op) for op in instr.operands)
+        return f"{prefix}{instr.opcode} {operands};"
 
     def kernel(self, kernel: PtxFunction) -> list[str]:
         return [
