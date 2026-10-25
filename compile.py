@@ -3,7 +3,7 @@ import math
 import sys
 import typing
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from pprint import pprint
 
@@ -228,15 +228,46 @@ class KernelLowerer:
             base = self.regs.get_reg(accum.base)
         value = self.regs.get_reg(accum.value)
         src = self.lower_elementwise(accum.op.reduce_canon, [base, value], dst.type)
-        src = self.coerce(src, dst.type)
-
         # update the loop-carried register without rebinding its name
+        self.update_reg(dst, src)
+
+    def update_reg(self, dst: Register, src: Register):
+        src = self.coerce(src, dst.type)
         if dst.type == "f16":
             self.add_instr("mov.b16", dst, src)
         else:
             self.add_instr(f"mov.{dst.type}", dst, src)
 
-    def lower_warp_shuffle(self, warp: WarpShuffle): ...
+    def lower_warp_shuffle(self, warp: WarpShuffle):
+        _, dtype = self.memory_types(warp.dtype)
+        if dtype not in ("f32", "s32", "u32"):
+            # TODO: exchange wider merge values using multiple b32 shuffles
+            raise NotImplementedError(f"warp shuffle merge dtype: {warp.dtype.name}")
+
+        state = {name: self.regs.get_reg(name) for name in warp.state}
+        mask = self.regs.new("u32")
+        self.add_instr("activemask.b32", mask)
+        offset = warp.length // 2
+        while offset > 0:
+            with self.regs.scope():
+                # exchange the full state before any component is updated
+                for name, other in zip(warp.state, warp.state_b, strict=True):
+                    src = self.coerce(state[name], dtype)
+                    dst = self.regs.new(dtype, other)
+                    self.add_instr("shfl.sync.bfly.b32", dst, src, offset, 0x1F, mask)
+                self.lower_merge_program(warp.combine_states, state, warp.dtype)
+            offset //= 2
+
+    def lower_merge_program(
+        self, program: tuple[Assign, ...], state: dict[str, Register], dtype: DataType
+    ):
+        for assign in program:
+            # merge assignments inherit the collective's computation type
+            self.lower_assign(replace(assign, dtype=dtype))
+            if assign.name in state:
+                dst = state[assign.name]
+                self.update_reg(dst, self.regs.get_reg(assign.name))
+                self.regs.bind(assign.name, dst)
 
     def lower_smem(self, smem: Smem): ...
 
