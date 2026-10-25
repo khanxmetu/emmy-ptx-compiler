@@ -181,21 +181,24 @@ class KernelLowerer:
         self.internal: KernelRegisters
 
     def lower_strided_loop(self, loop: StridedLoop):
-        end_expr = loop.end if loop.end is not None else loop.axis.extent_expr()
+        self.seed_accumulators(loop)
+        if loop.end is None:
+            end_expr = loop.axis.extent_expr()
+        else:
+            end_expr = loop.end
         # signed coordinates preserve negative differences in the body
-        start_src = self.coerce(self.lower_expr(loop.start), "s64")
-        step = self.coerce(self.lower_expr(loop.step), "s64")
-        end = self.coerce(self.lower_expr(end_expr), "s64")
+        start_src = self.lower_coordinate(loop.start)
+        step = self.lower_coordinate(loop.step)
+        end = self.lower_coordinate(end_expr)
 
         start = self.regs.new("s64")
         self.add_instr("mov.s64", start, start_src)
 
         head = self.func.new_label("loop")
         done = self.func.new_label("loop_end")
-        finished = self.regs.new("pred")
 
         self.func.add_label(head)
-        self.add_instr("setp.ge.s64", finished, start, end)
+        finished = self.lower_binary(">=", start, end)
         self.add_instr("bra", done, predicate=Predicate(finished))
         with self.regs.scope():
             self.regs.bind(loop.axis.name, start)
@@ -203,6 +206,19 @@ class KernelLowerer:
         self.add_instr("add.s64", start, start, step)
         self.add_instr("bra", head)
         self.func.add_label(done)
+
+    def seed_accumulators(self, loop: StridedLoop):
+        if not loop.seed:
+            return
+        seen = set()
+        for stmt in loop.body:
+            if not isinstance(stmt, Accum) or stmt.name in seen:
+                continue
+            seen.add(stmt.name)
+            identity = stmt.op.identity
+            _, reg_type = self.memory_types(stmt.dtype)
+            reg = self.lower_constant(identity, reg_type)
+            self.regs.bind(stmt.name, reg)
 
     def lower_accum(self, accum: Accum): ...
 
@@ -220,9 +236,7 @@ class KernelLowerer:
         self, indices: tuple[Expr, ...], shape: tuple[int, ...]
     ) -> Register:
         if not indices:
-            index = self.regs.new("u64")
-            self.add_instr("mov.u64", index, 0)
-            return index
+            return self.lower_constant(0, "u64")
         index = self.coerce(self.lower_expr(indices[0]), "u64")
         # flatten into row major index
         for d, expr in enumerate(indices[1:], 1):
@@ -473,22 +487,42 @@ class KernelLowerer:
         self.add_instr(f"{opcode}.{suffix}", dst, lhs, rhs)
         return dst
 
+    def lower_constant(self, value: int | float | bool, dtype: PtxRegisterType) -> Register:
+        # materialize a constant in the requested ptx type
+        if dtype == "pred":
+            src_type = "s32"
+            value = bool(value)
+        elif dtype == "f16":
+            src_type = "f32"
+        else:
+            src_type = dtype
+
+        if src_type.startswith("f"):
+            value = float(value)
+        else:
+            value = int(value)
+
+        src = self.regs.new(src_type)
+        self.add_instr(f"mov.{src_type}", src, value)
+        return self.coerce(src, dtype)
+
     def lower_literal(self, value: int | float | bool, dtype: str) -> Register:  # noqa: PYI041
-        if isinstance(value, bool):
-            dtype = "bool"
-        match dtype:
-            case "bool":
-                reg = self.regs.new("pred")
-                opcode = "setp.eq.s32" if value else "setp.ne.s32"
-                self.add_instr(opcode, reg, 0, 0)
-            case "float":
-                reg = self.regs.new("f32")
-                self.add_instr("mov.f32", reg, float(value))
-            case "int":
-                regtype = "s32" if -(1 << 31) <= value < (1 << 31) else "s64"
-                reg = self.regs.new(regtype)
-                self.add_instr(f"mov.{regtype}", reg, value)
-        return reg
+        # choose a ptx type for an ir literal
+        if isinstance(value, bool) or dtype == "bool":
+            reg_type = "pred"
+        elif dtype == "float":
+            reg_type = "f32"
+        elif -(1 << 31) <= value < (1 << 31):
+            reg_type = "s32"
+        else:
+            reg_type = "s64"
+        return self.lower_constant(value, reg_type)
+
+    def lower_coordinate(self, expr: Expr) -> Register:
+        # keep coordinate arithmetic signed and 64-bit
+        if isinstance(expr, Literal):
+            return self.lower_constant(expr.value, "s64")
+        return self.coerce(self.lower_expr(expr), "s64")
 
     def lower_expr(self, expr: Expr) -> Register:
         match expr:
@@ -530,20 +564,23 @@ class KernelLowerer:
         self.add_instr("ret", predicate=Predicate(reg=outofbounds))
 
         def bind_axes():
+            if not tile.axes:
+                return
+            # decode once into signed coordinate arithmetic
+            coord_gid = self.coerce(gid, "s64")
             dim_prod = 1
             for i, axis in enumerate(reversed(tile.axes)):
                 extent = axis.extent.as_static()
                 if dim_prod > 1:
-                    axis_reg = self.regs.new("u64")
-                    self.add_instr("div.u64", axis_reg, gid, dim_prod)
+                    axis_reg = self.regs.new("s64")
+                    self.add_instr("div.s64", axis_reg, coord_gid, dim_prod)
                 else:
-                    axis_reg = gid
+                    axis_reg = coord_gid
                 if i != len(tile.axes) - 1:
-                    coord = self.regs.new("u64")
-                    self.add_instr("rem.u64", coord, axis_reg, extent)
+                    coord = self.regs.new("s64")
+                    self.add_instr("rem.s64", coord, axis_reg, extent)
                     axis_reg = coord
-                # coordinates may become negative during index arithmetic
-                self.regs.bind(axis.name, self.coerce(axis_reg, "s64"))
+                self.regs.bind(axis.name, axis_reg)
                 dim_prod *= extent
 
         with self.regs.scope():
