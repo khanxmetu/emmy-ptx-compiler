@@ -307,9 +307,60 @@ class KernelLowerer:
                 self.lower_body(cond.else_body)
         self.func.add_label(done)
 
-    def lower_sync(self, sync: Sync): ...
+    def lower_sync(self, sync: Sync):
+        if sync.warp:
+            # match the default full-warp mask of __syncwarp()
+            self.add_instr("bar.warp.sync", 0xFFFFFFFF)
+        elif sync.barrier_id == 0:
+            self.add_instr("bar.sync", 0)
+        else:
+            self.add_instr("bar.sync", sync.barrier_id, sync.count)
 
-    def lower_tree_halve(self, tree_halve: TreeHalve): ...
+    def lower_tree_halve(self, tree_halve: TreeHalve):
+        state = {name: self.regs.get_reg(name) for name in tree_halve.state}
+        tid = Var(tree_halve.tid_var)
+
+        def index(coord: Expr) -> Expr:
+            if tree_halve.inner is None:
+                return coord
+            name, scale = tree_halve.inner
+            return BinaryExpr(
+                "+", BinaryExpr("*", coord, Literal(scale, "int")), Var(name)
+            )
+
+        slot = index(tid)
+        root = index(Literal(0, "int"))
+        offset = tree_halve.length // 2
+        while offset > 0:
+            done = self.func.new_label("tree_step_end")
+            pred = self.as_pred(
+                self.lower_expr(BinaryExpr("<", tid, Literal(offset, "int")))
+            )
+            self.add_instr("bra", done, predicate=Predicate(pred, negated=True))
+            other = index(BinaryExpr("+", tid, Literal(offset, "int")))
+            with self.regs.scope():
+                # load every component before the merge can change any of them
+                for buf, name, partner in zip(
+                    tree_halve.bufs, tree_halve.state, tree_halve.state_b, strict=True
+                ):
+                    self.lower_load(Load(name=name, input=buf, index=(slot,)))
+                    self.lower_load(Load(name=partner, input=buf, index=(other,)))
+                local_state = {name: self.regs.get_reg(name) for name in state}
+                self.lower_merge_program(
+                    tree_halve.combine_states, local_state, tree_halve.dtype
+                )
+                for buf, name in zip(tree_halve.bufs, tree_halve.state, strict=True):
+                    self.lower_write(Write(output=buf, index=(slot,), value=name))
+            self.func.add_label(done)
+            # all participants must finish this level before reading the next
+            self.lower_sync(Sync(tree_halve.barrier_id, tree_halve.barrier_count))
+            offset //= 2
+
+        with self.regs.scope():
+            for buf, name in zip(tree_halve.bufs, tree_halve.state, strict=True):
+                self.lower_load(Load(name=name, input=buf, index=(root,)))
+                # preserve the carried registers and narrow only at broadcast
+                self.update_reg(state[name], self.regs.get_reg(name))
 
     def lower_index(
         self, indices: tuple[Expr, ...], shape: tuple[int, ...]
