@@ -170,13 +170,6 @@ class PtxModule:
     header: PtxHeader = field(default_factory=PtxHeader)
     kernels: list[PtxFunction] = field(default_factory=list)
 
-@dataclass
-class KernelRegisters:
-    gid: Register
-    warp: Register
-    lane: Register
-
-
 class KernelLowerer:
     def __init__(self, graph: Graph, params: list[FuncParam], ir_kernel: KernelOp):
         self.graph = graph
@@ -186,7 +179,6 @@ class KernelLowerer:
         self.regs = self.func.registers
         self.params = self.func.params
         self.add_instr = self.func.add_instr
-        self.internal: KernelRegisters
 
     def lower_strided_loop(self, loop: StridedLoop):
         self.seed_accumulators(loop)
@@ -297,7 +289,23 @@ class KernelLowerer:
         if total > 48 * 1024:
             raise NotImplementedError("dynamic shared memory lowering is not implemented")
 
-    def lower_cond(self, cond: Cond): ...
+    def lower_cond(self, cond: Cond):
+        pred = self.as_pred(self.lower_expr(cond.cond))
+        done = self.func.new_label("endif")
+        if cond.else_body:
+            otherwise = self.func.new_label("else")
+        else:
+            otherwise = done
+
+        self.add_instr("bra", otherwise, predicate=Predicate(pred, negated=True))
+        with self.regs.scope():
+            self.lower_body(cond.body)
+        if cond.else_body:
+            self.add_instr("bra", done)
+            self.func.add_label(otherwise)
+            with self.regs.scope():
+                self.lower_body(cond.else_body)
+        self.func.add_label(done)
 
     def lower_sync(self, sync: Sync): ...
 
@@ -629,7 +637,7 @@ class KernelLowerer:
 
     def lower_tile(self, tile: Tile):
         # pprint(tile)
-        gid = self.internal.gid
+        gid = self.regs.get_reg("_gid")
         N = tile.n_elements
         outofbounds = self.regs.new("pred")
         self.add_instr("setp.ge.u64", outofbounds, gid, N)
@@ -672,10 +680,9 @@ class KernelLowerer:
         bid = self.regs.new("u32")
         bdim = self.regs.new("u32")
         tid64 = self.regs.new("u64")
-        gid = self.regs.new("u64")
-        warp = self.regs.new("u32")
-        lane = self.regs.new("u32")
-        self.internal = KernelRegisters(gid=gid, warp=warp, lane=lane)
+        gid = self.regs.new("u64", "_gid")
+        warp = self.regs.new("u32", "warp")
+        lane = self.regs.new("u32", "lane")
 
         self.add_instr("mov.u32", tid, "%tid.x")
         self.add_instr("mov.u32", bid, "%ctaid.x")
