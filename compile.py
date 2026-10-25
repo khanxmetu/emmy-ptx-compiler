@@ -421,18 +421,39 @@ class KernelLowerer:
             "bool": ("u8", "s32"),
         }[dtype.name]
 
+    @staticmethod
+    def memory_operands(
+        regs: list[Register], dtype: DataType
+    ) -> typing.Iterator[tuple[int, str, Register | str]]:
+        # grouped IR accesses are aligned by emmy's vectorization passes
+        # ptx 8.0 supports up to four elements and sixteen bytes per access
+        start = 0
+        while start < len(regs):
+            width = 1
+            for size in (4, 2):
+                if size * dtype.nbytes <= 16 and start + size <= len(regs):
+                    width = size
+                    break
+            if width == 1:
+                suffix = ""
+                operand = regs[start]
+            else:
+                suffix = f".v{width}"
+                operand = "{" + ", ".join(map(str, regs[start : start + width])) + "}"
+            yield start * dtype.nbytes, suffix, operand
+            start += width
+
     def lower_load(self, load: Load):
         addr, space, dtype = self.buffer_address(load.input, load.index, load.dtype)
         mem_type, reg_type = self.memory_types(dtype)
-        # TODO: group consecutive loads into vector instructions
-        for i, name in enumerate(load.names):
-            reg = self.regs.new(reg_type)
-            offset = i * dtype.nbytes
+        regs = [self.regs.new(reg_type) for _ in load.names]
+        for offset, suffix, dst in self.memory_operands(regs, dtype):
             self.add_instr(
-                f"ld.{space}.{mem_type}",
-                reg,
+                f"ld.{space}{suffix}.{mem_type}",
+                dst,
                 f"[{addr} + {offset}]",
             )
+        for name, reg in zip(load.names, regs):
             if dtype.name == "bool":
                 reg = self.as_pred(reg)
             self.regs.bind(name, reg)
@@ -496,19 +517,20 @@ class KernelLowerer:
     def lower_write(self, write: Write):
         addr, space, dtype = self.buffer_address(write.output, write.index)
         mem_type, reg_type = self.memory_types(dtype)
-        # TODO grouped write should become vector store
-        for i, name in enumerate(write.values):
+        regs = []
+        for name in write.values:
             reg = self.regs.get_reg(name)
             if dtype.name == "bool":
                 reg = self.as_pred(reg)
-            reg = self.coerce(reg, reg_type)
-            offset = i * dtype.nbytes
+            regs.append(self.coerce(reg, reg_type))
+        # atomic writes have one value, so they retain a scalar operand
+        for offset, suffix, src in self.memory_operands(regs, dtype):
             dst = f"[{addr} + {offset}]"
             if write.atomic:
                 atomic_type = "u64" if mem_type == "s64" else mem_type
-                self.add_instr(f"red.{space}.add.{atomic_type}", dst, reg)
+                self.add_instr(f"red.{space}.add.{atomic_type}", dst, src)
             else:
-                self.add_instr(f"st.{space}.{mem_type}", dst, reg)
+                self.add_instr(f"st.{space}{suffix}.{mem_type}", dst, src)
 
     @staticmethod
     def numeric_type(dtype: PtxRegisterType) -> PtxRegisterType:
