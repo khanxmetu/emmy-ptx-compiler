@@ -1,6 +1,5 @@
 import json
 import math
-import struct
 import sys
 import typing
 from contextlib import contextmanager
@@ -22,10 +21,6 @@ from emmy.compiler.ir.kernel.ir import (
 )
 from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
 from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-
-
-def ptx_f32_literal(val: float) -> str:
-    return "0f" + struct.pack(">f", val).hex()
 
 
 def load_ir_graph(ir_path: Path) -> tuple[Graph, dict]:
@@ -150,13 +145,6 @@ class PtxModule:
     header: PtxHeader = field(default_factory=PtxHeader)
     kernels: list[PtxFunction] = field(default_factory=list)
 
-
-@dataclass
-class PtxCodegenCtx:
-    argnames: dict[str, list[str]]
-    ir: Graph
-
-
 @dataclass
 class KernelRegisters:
     gid: Register
@@ -175,7 +163,16 @@ class KernelLowerer:
         self.add_instr = self.func.add_instr
         self.internal: KernelRegisters
 
-    def lower_strided_loop(self, loop: StridedLoop): ...
+    def lower_strided_loop(self, loop: StridedLoop):
+        start_src = self.lower_expr(loop.start)
+        start = self.regs.new(start_src.type)
+        self.add_instr(f"mov.{start_src.type}", start, start_src)
+
+        step_src = self.lower_expr(loop.step)
+        step = self.regs.new(step_src.type)
+        self.add_instr(f"mov.{step_src.type}", step, step_src)
+
+        print(loop.end)
 
     def lower_accum(self, accum: Accum): ...
 
@@ -279,22 +276,20 @@ class KernelLowerer:
         }.get(assign.dtype.name, assign.dtype.name)
         args = [self.regs.get_reg(name) for name in assign.args]
         if assign.op.name == "copy":
-            dst = self.coerce(args[0], dst_type)
+            dst = args[0]
         else:
             dst = self.lower_elementwise(assign.op.name, args, dst_type)
-            dst = self.coerce(dst, dst_type)
-        self.regs.bind(assign.name, dst)
+        self.regs.bind(assign.name, self.coerce(dst, dst_type))
 
     def lower_elementwise(
         self, op: str, args: list[Register], dst_type: PtxRegisterType
     ) -> Register:
-        compute_type = "f32"
         if op in ("add", "subtract", "multiply") and dst_type.startswith(("s", "u")):
             compute_type = self.numeric_type(dst_type)
-        elif (
-            op == "add" and dst_type == "f16" and all(reg.type == "f16" for reg in args)
-        ):
-            compute_type = "f16"
+        else:
+            # simplify floating-point computation to f32
+             # TODO: preserve wider computation precision
+            compute_type = "f32"
 
         args = [self.coerce(reg, compute_type) for reg in args]
         dst = self.regs.new(compute_type)
@@ -311,14 +306,12 @@ class KernelLowerer:
             case "exp":
                 scaled = self.regs.new("f32")
                 # exp(x) = 2 ** (x * log2(e))
-                self.add_instr(
-                    "mul.f32", scaled, args[0], ptx_f32_literal(math.log2(math.e))
-                )
+                self.add_instr("mul.f32", scaled, args[0], math.log2(math.e))
                 self.add_instr("ex2.approx.f32", dst, scaled)
             case "reciprocal":
                 self.add_instr("rcp.rn.f32", dst, args[0])
             case "relu":
-                self.add_instr("max.f32", dst, "0f00000000", args[0])
+                self.add_instr("max.f32", dst, 0.0, args[0])
             case "sqrt":
                 self.add_instr("sqrt.rn.f32", dst, args[0])
             case _:
@@ -328,6 +321,7 @@ class KernelLowerer:
     def lower_write(self, write: Write):
         addr, space, dtype = self.buffer_address(write.output, write.index)
         mem_type, reg_type = self.memory_types(dtype)
+        # TODO grouped write should become vector store
         for i, name in enumerate(write.values):
             reg = self.regs.get_reg(name)
             if dtype.name == "bool":
@@ -343,6 +337,7 @@ class KernelLowerer:
 
     @staticmethod
     def numeric_type(dtype: PtxRegisterType) -> PtxRegisterType:
+        # c style integer/float promotion
         # for smaller types use s32/f32 for computations
         if dtype in ("s16", "u8", "u16", "pred"):
             return "s32"
@@ -382,11 +377,7 @@ class KernelLowerer:
         dst = self.regs.new("pred")
         # unordered comparison keeps NaN truthy
         cmp = "neu" if reg.type.startswith("f") else "ne"
-        zero = (
-            "0f00000000"
-            if reg.type == "f32"
-            else ("0d0000000000000000" if reg.type == "f64" else 0)
-        )
+        zero = 0.0 if reg.type.startswith("f") else 0
         self.add_instr(f"setp.{cmp}.{reg.type}", dst, reg, zero)
         return dst
 
@@ -462,7 +453,7 @@ class KernelLowerer:
                 self.add_instr(opcode, reg, 0, 0)
             case "float":
                 reg = self.regs.new("f32")
-                self.add_instr("mov.f32", reg, ptx_f32_literal(value))
+                self.add_instr("mov.f32", reg, float(value))
             case "int":
                 regtype = "s32" if -(1 << 31) <= value < (1 << 31) else "s64"
                 reg = self.regs.new(regtype)
@@ -512,10 +503,11 @@ class KernelLowerer:
             dim_prod = 1
             for i, axis in enumerate(reversed(tile.axes)):
                 extent = axis.extent.as_static()
-                axis_reg = gid
                 if dim_prod > 1:
                     axis_reg = self.regs.new("u64")
                     self.add_instr("div.u64", axis_reg, gid, dim_prod)
+                else:
+                    axis_reg = gid
                 if i != len(tile.axes) - 1:
                     coord = self.regs.new("u64")
                     self.add_instr("rem.u64", coord, axis_reg, extent)
@@ -529,11 +521,9 @@ class KernelLowerer:
 
     def prologue(self) -> None:
         for param in self.params:
-            addr_reg = self.regs.new("b64", param.name)
-            self.add_instr("ld.param.u64", addr_reg, "[" + param.name + "]")
-        for param in self.params:
-            addr_reg = self.regs.get_reg(param.name)
             gaddr_reg = self.regs.new("b64", param.name)
+            addr_reg = self.regs.new("b64")
+            self.add_instr("ld.param.u64", addr_reg, "[" + param.name + "]")
             self.add_instr("cvta.to.global.u64", gaddr_reg, addr_reg)
 
         # kernel launches use only the x dimension
@@ -647,7 +637,9 @@ class PtxPrinter:
             pred = instr.predicate
             prefix = f"@{'!' if pred.negated else ''}{pred.reg} "
 
-        operands = ", ".join(str(op) for op in instr.operands)
+        operands = ", ".join(
+            str(int(op)) if isinstance(op, bool) else str(op) for op in instr.operands
+        )
         return f"{prefix}{instr.opcode} {operands};"
 
     def kernel(self, kernel: PtxFunction) -> list[str]:
