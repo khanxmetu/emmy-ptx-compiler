@@ -110,6 +110,14 @@ class PtxInstr:
     predicate: Predicate | None = None
 
 
+@dataclass(frozen=True)
+class PtxLabel:
+    name: str
+
+    def __str__(self) -> str:
+        return self.name
+
+
 @dataclass
 class FuncParam:
     name: str
@@ -122,12 +130,21 @@ class PtxFunction:
     name: str
     params: list[FuncParam] = field(default_factory=list)
     registers: RegisterStore = field(default_factory=RegisterStore)
-    instructions: list[PtxInstr] = field(default_factory=list)
+    instructions: list[PtxInstr | PtxLabel] = field(default_factory=list)
+    label_count: int = field(default=0, init=False)
+
+    def new_label(self, name: str) -> PtxLabel:
+        label = PtxLabel(f"%L_{name}_{self.label_count}")
+        self.label_count += 1
+        return label
+
+    def add_label(self, label: PtxLabel) -> None:
+        self.instructions.append(label)
 
     def add_instr(
         self,
         opcode: str,
-        *operands: Register | str | float,
+        *operands: Register | PtxLabel | str | int | float,
         predicate: Predicate | None = None,
     ) -> None:
         self.instructions.append(PtxInstr(opcode, operands, predicate))
@@ -164,15 +181,28 @@ class KernelLowerer:
         self.internal: KernelRegisters
 
     def lower_strided_loop(self, loop: StridedLoop):
-        start_src = self.lower_expr(loop.start)
-        start = self.regs.new(start_src.type)
-        self.add_instr(f"mov.{start_src.type}", start, start_src)
+        end_expr = loop.end if loop.end is not None else loop.axis.extent_expr()
+        # signed coordinates preserve negative differences in the body
+        start_src = self.coerce(self.lower_expr(loop.start), "s64")
+        step = self.coerce(self.lower_expr(loop.step), "s64")
+        end = self.coerce(self.lower_expr(end_expr), "s64")
 
-        step_src = self.lower_expr(loop.step)
-        step = self.regs.new(step_src.type)
-        self.add_instr(f"mov.{step_src.type}", step, step_src)
+        start = self.regs.new("s64")
+        self.add_instr("mov.s64", start, start_src)
 
-        print(loop.end)
+        head = self.func.new_label("loop")
+        done = self.func.new_label("loop_end")
+        finished = self.regs.new("pred")
+
+        self.func.add_label(head)
+        self.add_instr("setp.ge.s64", finished, start, end)
+        self.add_instr("bra", done, predicate=Predicate(finished))
+        with self.regs.scope():
+            self.regs.bind(loop.axis.name, start)
+            self.lower_body(loop.body)
+        self.add_instr("add.s64", start, start, step)
+        self.add_instr("bra", head)
+        self.func.add_label(done)
 
     def lower_accum(self, accum: Accum): ...
 
@@ -512,7 +542,8 @@ class KernelLowerer:
                     coord = self.regs.new("u64")
                     self.add_instr("rem.u64", coord, axis_reg, extent)
                     axis_reg = coord
-                self.regs.bind(axis.name, axis_reg)
+                # coordinates may become negative during index arithmetic
+                self.regs.bind(axis.name, self.coerce(axis_reg, "s64"))
                 dim_prod *= extent
 
         with self.regs.scope():
@@ -631,7 +662,10 @@ class PtxPrinter:
             if count
         ]
 
-    def instruction(self, instr: PtxInstr) -> list[str]:
+    def instruction(self, instr: PtxInstr | PtxLabel) -> str:
+        if isinstance(instr, PtxLabel):
+            return f"{instr.name}:"
+
         prefix = ""
         if instr.predicate is not None:
             pred = instr.predicate
