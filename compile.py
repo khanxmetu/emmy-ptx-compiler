@@ -240,8 +240,7 @@ class KernelLowerer:
 
     def lower_warp_shuffle(self, warp: WarpShuffle):
         _, dtype = self.memory_types(warp.dtype)
-        if dtype not in ("f32", "s32", "u32"):
-            # TODO: exchange wider merge values using multiple b32 shuffles
+        if dtype not in ("f32", "s32", "u32", "f64", "s64", "u64"):
             raise NotImplementedError(f"warp shuffle merge dtype: {warp.dtype.name}")
 
         state = {name: self.regs.get_reg(name) for name in warp.state}
@@ -254,7 +253,18 @@ class KernelLowerer:
                 for name, other in zip(warp.state, warp.state_b, strict=True):
                     src = self.coerce(state[name], dtype)
                     dst = self.regs.new(dtype, other)
-                    self.add_instr("shfl.sync.bfly.b32", dst, src, offset, 0x1F, mask)
+                    if dtype in ("f64", "s64", "u64"):
+                        # mov.b64 packs/unpacks bits without numeric conversion.
+                        words = [self.regs.new("b32") for _ in range(2)]
+                        packed = "{" + ", ".join(map(str, words)) + "}"
+                        self.add_instr("mov.b64", packed, src)
+                        for word in words:
+                            self.add_instr(
+                                "shfl.sync.bfly.b32", word, word, offset, 0x1F, mask
+                            )
+                        self.add_instr("mov.b64", dst, packed)
+                    else:
+                        self.add_instr("shfl.sync.bfly.b32", dst, src, offset, 0x1F, mask)
                 self.lower_merge_program(warp.combine_states, state, warp.dtype)
             offset //= 2
 
