@@ -220,7 +220,21 @@ class KernelLowerer:
             reg = self.lower_constant(identity, reg_type)
             self.regs.bind(stmt.name, reg)
 
-    def lower_accum(self, accum: Accum): ...
+    def lower_accum(self, accum: Accum):
+        dst = self.regs.get_reg(accum.name)
+        if accum.base is None:
+            base = dst
+        else:
+            base = self.regs.get_reg(accum.base)
+        value = self.regs.get_reg(accum.value)
+        src = self.lower_elementwise(accum.op.reduce_canon, [base, value], dst.type)
+        src = self.coerce(src, dst.type)
+
+        # update the loop-carried register without rebinding its name
+        if dst.type == "f16":
+            self.add_instr("mov.b16", dst, src)
+        else:
+            self.add_instr(f"mov.{dst.type}", dst, src)
 
     def lower_warp_shuffle(self, warp: WarpShuffle): ...
 
@@ -328,24 +342,27 @@ class KernelLowerer:
     def lower_elementwise(
         self, op: str, args: list[Register], dst_type: PtxRegisterType
     ) -> Register:
-        if op in ("add", "subtract", "multiply") and dst_type.startswith(("s", "u")):
+        if op in ("add", "subtract", "multiply", "maximum", "minimum"):
             compute_type = self.numeric_type(dst_type)
         else:
             # simplify floating-point computation to f32
-             # TODO: preserve wider computation precision
+            # TODO: preserve wider computation precision
             compute_type = "f32"
 
         args = [self.coerce(reg, compute_type) for reg in args]
         dst = self.regs.new(compute_type)
         match op:
-            case "add" | "subtract" | "multiply" | "divide" | "maximum":
+            case "add" | "subtract" | "multiply" | "divide" | "maximum" | "minimum":
                 opcode = {
                     "add": "add",
                     "subtract": "sub",
-                    "multiply": "mul" if compute_type.startswith("f") else "mul.lo",
+                    "multiply": "mul",
                     "divide": "div.rn",
                     "maximum": "max",
+                    "minimum": "min",
                 }[op]
+                if op == "multiply" and not compute_type.startswith("f"):
+                    opcode = "mul.lo"
                 self.add_instr(f"{opcode}.{compute_type}", dst, *args)
             case "exp":
                 scaled = self.regs.new("f32")
