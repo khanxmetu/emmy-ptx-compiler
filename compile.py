@@ -126,12 +126,20 @@ class FuncParam:
 
 
 @dataclass
+class SharedMemory:
+    name: str
+    nbytes: int
+    align: int
+
+
+@dataclass
 class PtxFunction:
     name: str
     params: list[FuncParam] = field(default_factory=list)
     registers: RegisterStore = field(default_factory=RegisterStore)
     instructions: list[PtxInstr | PtxLabel] = field(default_factory=list)
     label_count: int = field(default=0, init=False)
+    shared: dict[str, SharedMemory] = field(default_factory=dict)
 
     def new_label(self, name: str) -> PtxLabel:
         label = PtxLabel(f"%L_{name}_{self.label_count}")
@@ -269,7 +277,25 @@ class KernelLowerer:
                 self.update_reg(dst, self.regs.get_reg(assign.name))
                 self.regs.bind(assign.name, dst)
 
-    def lower_smem(self, smem: Smem): ...
+    @staticmethod
+    def smem_dtype(smem: Smem) -> DataType:
+        return get_dtype(
+            {"float": "f32", "__half": "f16", "double": "f64"}[smem.dtype]
+        )
+
+    def lower_smem(self, smem: Smem):
+        dtype = self.smem_dtype(smem)
+        nbytes = math.prod(smem.extents) * dtype.nbytes
+        align = max(dtype.nbytes, smem.align)
+        self.func.shared[smem.name] = SharedMemory(smem.name, nbytes, align)
+
+        # larger allocations need dynamic shared memory, which is not lowered yet
+        total = 0
+        for shared in self.func.shared.values():
+            total = (total + shared.align - 1) // shared.align * shared.align
+            total += shared.nbytes
+        if total > 48 * 1024:
+            raise NotImplementedError("dynamic shared memory lowering is not implemented")
 
     def lower_cond(self, cond: Cond): ...
 
@@ -298,9 +324,7 @@ class KernelLowerer:
         shared = self.ir_kernel.smem_buffers.get(name)
         if shared is not None:
             shape = shared.extents
-            dtype = dtype or get_dtype(
-                {"float": "f32", "__half": "f16", "double": "f64"}[shared.dtype]
-            )
+            dtype = dtype or self.smem_dtype(shared)
             base = self.regs.new("u64")
             self.add_instr("mov.u64", base, shared.name)
             space = "shared"
@@ -766,6 +790,10 @@ class PtxPrinter:
             *self.signature(kernel),
             "{",
             *self.registers(kernel.registers),
+            *(
+                f".shared .align {shared.align} .b8 {shared.name}[{shared.nbytes}];"
+                for shared in kernel.shared.values()
+            ),
             *(self.instruction(i) for i in kernel.instructions),
             "}",
         ]
