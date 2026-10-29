@@ -12,6 +12,9 @@ from emmy.compiler.dtype import get as get_dtype
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.kernel.ir import (
+    CpAsyncCommit,
+    CpAsyncCopy,
+    CpAsyncWait,
     KernelOp,
     Smem,
     Sync,
@@ -19,8 +22,8 @@ from emmy.compiler.ir.kernel.ir import (
     TreeHalve,
     WarpShuffle,
 )
-from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
-from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Write
 
 
 def load_ir_graph(ir_path: Path) -> tuple[Graph, dict]:
@@ -53,6 +56,9 @@ PtxRegisterType = typing.Literal[
     "b128",
     "pred",
 ]
+
+# XOR row bits into each 16-byte chunk index.
+_SWIZZLE_XOR = {"B128": (6, 0x7), "B64": (6, 0x3), "B32": (6, 0x1)}
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,7 @@ class SharedMemory:
     name: str
     nbytes: int
     align: int
+    offset: int = 0
 
 
 @dataclass
@@ -140,6 +147,8 @@ class PtxFunction:
     instructions: list[PtxInstr | PtxLabel] = field(default_factory=list)
     label_count: int = field(default=0, init=False)
     shared: dict[str, SharedMemory] = field(default_factory=dict)
+    dynamic_shared: bool = False
+    shared_align: int = 16
 
     def new_label(self, name: str) -> PtxLabel:
         label = PtxLabel(f"%L_{name}_{self.label_count}")
@@ -179,6 +188,19 @@ class KernelLowerer:
         self.regs = self.func.registers
         self.params = self.func.params
         self.add_instr = self.func.add_instr
+        self.plan_shared_memory()
+
+    def plan_shared_memory(self):
+        offset = 0
+        for smem in self.ir_kernel.smem_buffers.values():
+            dtype = self.smem_dtype(smem)
+            align = max(dtype.nbytes, smem.align)
+            offset = (offset + align - 1) // align * align
+            nbytes = math.prod(smem.extents) * dtype.nbytes
+            self.func.shared[smem.name] = SharedMemory(smem.name, nbytes, align, offset)
+            offset += nbytes
+            self.func.shared_align = max(self.func.shared_align, align)
+        self.func.dynamic_shared = offset > 48 * 1024
 
     def lower_strided_loop(self, loop: StridedLoop):
         self.seed_accumulators(loop)
@@ -207,7 +229,66 @@ class KernelLowerer:
         self.add_instr("bra", head)
         self.func.add_label(done)
 
-    def seed_accumulators(self, loop: StridedLoop):
+    def lower_loop(self, loop: Loop):
+        self.seed_accumulators(loop)
+
+        index = self.regs.new("s64")
+        self.add_instr("mov.s64", index, 0)
+        extent = self.lower_coordinate(loop.axis.extent_expr())
+        head = self.func.new_label("loop")
+        done = self.func.new_label("loop_end")
+        self.func.add_label(head)
+        finished = self.lower_binary(">=", index, extent)
+        self.add_instr("bra", done, predicate=Predicate(finished))
+        with self.regs.scope():
+            self.regs.bind(loop.axis.name, index)
+            self.lower_body(loop.body)
+        self.add_instr("add.s64", index, index, 1)
+        self.add_instr("bra", head)
+        self.func.add_label(done)
+
+    def lower_init(self, init: Init):
+        _, reg_type = self.memory_types(init.dtype)
+        self.regs.bind(init.name, self.lower_constant(init.identity, reg_type))
+
+    def lower_cp_async_copy(self, copy: CpAsyncCopy):
+        src, _, _ = self.buffer_address(copy.src, copy.src_index)
+        smem = self.ir_kernel.smem_buffers[copy.smem]
+        dtype = self.smem_dtype(smem)
+        dst, _, _ = self.buffer_address(copy.smem, (), dtype)
+        dst_index = self.lower_index(copy.smem_index, smem.extents)
+        if copy.lane_index is not None:
+            lane = self.lower_index(copy.lane_index, smem.extents)
+            dst_index = self.lower_binary("+", dst_index, lane)
+        dst_index = self.swizzle_index(dst_index, copy.swizzle)
+        dst_offset = self.regs.new("u64")
+        self.add_instr("mad.lo.u64", dst_offset, dst_index, dtype.nbytes, dst)
+        shared_addr = self.regs.new("u64")
+        self.add_instr("cvta.to.shared.u64", shared_addr, dst_offset)
+        shared_dst = self.regs.new("u32")
+        self.add_instr("cvt.u32.u64", shared_dst, shared_addr)
+        qualifier = "cg" if copy.nbytes == 16 else "ca"
+        self.add_instr(
+            f"cp.async.{qualifier}.shared.global",
+            f"[{shared_dst}]",
+            f"[{src}]",
+            copy.nbytes,
+        )
+
+    def swizzle_index(self, index: Register, mode: str) -> Register:
+        base, separator, shift_text = mode.partition("@")
+        params = _SWIZZLE_XOR.get(base)
+        if params is None:
+            return index
+        shift, mask = params
+        if separator:
+            shift = int(shift_text)
+        shifted = self.lower_binary(">>", index, self.lower_constant(shift, "u32"))
+        masked = self.lower_binary("&", shifted, self.lower_constant(mask, "u64"))
+        delta = self.lower_binary("<<", masked, self.lower_constant(3, "u32"))
+        return self.lower_binary("^", index, delta)
+
+    def seed_accumulators(self, loop: Loop | StridedLoop):
         if not loop.seed:
             return
         seen = set()
@@ -284,20 +365,6 @@ class KernelLowerer:
         return get_dtype(
             {"float": "f32", "__half": "f16", "double": "f64"}[smem.dtype]
         )
-
-    def lower_smem(self, smem: Smem):
-        dtype = self.smem_dtype(smem)
-        nbytes = math.prod(smem.extents) * dtype.nbytes
-        align = max(dtype.nbytes, smem.align)
-        self.func.shared[smem.name] = SharedMemory(smem.name, nbytes, align)
-
-        # larger allocations need dynamic shared memory, which is not lowered yet
-        total = 0
-        for shared in self.func.shared.values():
-            total = (total + shared.align - 1) // shared.align * shared.align
-            total += shared.nbytes
-        if total > 48 * 1024:
-            raise NotImplementedError("dynamic shared memory lowering is not implemented")
 
     def lower_cond(self, cond: Cond):
         pred = self.as_pred(self.lower_expr(cond.cond))
@@ -395,7 +462,13 @@ class KernelLowerer:
             shape = shared.extents
             dtype = dtype or self.smem_dtype(shared)
             base = self.regs.new("u64")
-            self.add_instr("mov.u64", base, shared.name)
+            if self.func.dynamic_shared:
+                self.add_instr("mov.u64", base, "__dynamic_smem")
+                offset = self.func.shared[name].offset
+                if offset:
+                    self.add_instr("add.u64", base, base, offset)
+            else:
+                self.add_instr("mov.u64", base, shared.name)
             space = "shared"
         else:
             buffer = (
@@ -628,6 +701,14 @@ class KernelLowerer:
             case "^":
                 opcode = "xor"
                 suffix = f"b{lhs.type[1:]}"
+            case "&":
+                opcode = "and"
+                suffix = f"b{lhs.type[1:]}"
+            case "<<":
+                opcode = "shl"
+                suffix = f"b{lhs.type[1:]}"
+            case ">>":
+                opcode = "shr"
             case "&&":
                 opcode = "and"
             case "||":
@@ -786,12 +867,22 @@ class KernelLowerer:
                 self.lower_tile(stmt)
             case StridedLoop():
                 self.lower_strided_loop(stmt)
+            case Loop():
+                self.lower_loop(stmt)
+            case Init():
+                self.lower_init(stmt)
+            case CpAsyncCopy():
+                self.lower_cp_async_copy(stmt)
+            case CpAsyncCommit():
+                self.add_instr("cp.async.commit_group")
+            case CpAsyncWait(group=group):
+                self.add_instr("cp.async.wait_group", group)
             case Accum():
                 self.lower_accum(stmt)
             case WarpShuffle():
                 self.lower_warp_shuffle(stmt)
             case Smem():
-                self.lower_smem(stmt)
+                pass  # storage is planned from every nested declaration up front
             case Cond():
                 self.lower_cond(stmt)
             case Sync():
@@ -876,20 +967,30 @@ class PtxPrinter:
         return f"{prefix}{instr.opcode} {operands};"
 
     def kernel(self, kernel: PtxFunction) -> list[str]:
+        shared_decls = []
+        if not kernel.dynamic_shared:
+            shared_decls = [
+                f".shared .align {shared.align} .b8 {shared.name}[{shared.nbytes}];"
+                for shared in kernel.shared.values()
+            ]
         return [
             *self.signature(kernel),
             "{",
             *self.registers(kernel.registers),
-            *(
-                f".shared .align {shared.align} .b8 {shared.name}[{shared.nbytes}];"
-                for shared in kernel.shared.values()
-            ),
+            *shared_decls,
             *(self.instruction(i) for i in kernel.instructions),
             "}",
         ]
 
     def module(self, module: PtxModule) -> list[str]:
         lines = self.header(module.header)
+        if any(kernel.dynamic_shared for kernel in module.kernels):
+            align = max(
+                kernel.shared_align
+                for kernel in module.kernels
+                if kernel.dynamic_shared
+            )
+            lines.append(f".extern .shared .align {align} .b8 __dynamic_smem[];")
         for kernel in module.kernels:
             lines.extend(self.kernel(kernel))
         return lines
