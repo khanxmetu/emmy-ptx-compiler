@@ -1,116 +1,148 @@
-# Emmy Hackathon — write a PTX compiler for Kernel IR
+# Emmy Kernel IR to PTX
 
-Emmy (github.com/cloudrift-ai/emmy) compiles PyTorch to CUDA C++ and builds it with `nvcc`.
-**Your task: write a compiler that takes Emmy's Kernel IR and emits PTX directly**, skipping the
-CUDA C++ step. `ptxas` turns PTX into the same GPU binary ~19× faster than the full `nvcc`
-pipeline — Emmy's autotuner compiles thousands of kernel variants, so that middle step matters.
+This project is a submission for [emmy-hackathon-2026](https://github.com/cloudrift-ai/emmy-hackathon-2026). It implements an Emmy Kernel IR to PTX compiler for a subset of Kernel IR operations and lowers them directly to PTX.
 
-You do **not** need a GPU. A hosted runner at `http://runner.riftstack.ai:48701` (the default in `submit.py`) compiles
-your PTX with `ptxas`, executes it on real hardware, and tells you whether the output is correct. See [docs/API.md](docs/API.md).
+## Run the compiler
 
-## Requirements
-
-- **Python 3.12 or newer.** The Kernel IR only deserializes through Emmy's own classes:
-
-  ```bash
-  pip install emmy-ml==0.3.11       # no torch, no CUDA, no GPU needed
-  ```
-
-  This alone reads every problem IR. Torch is **not** needed — it is only required to
-  *generate* new IRs from PyTorch expressions, which is optional.
-
-- Your submission is a **program**, not PTX files. It must run as:
-
-  ```bash
-  python compile.py path/to/kernel.ir.json > out.ptx
-  ```
-
-  This contract matters: submissions are evaluated against a **hidden set** of Kernel IRs in the
-  same categories as the open problems. Hardcoding the open set scores nothing.
-
-## Five-minute start
+Requirements:
 
 ```bash
-git clone https://github.com/cloudrift-ai/emmy-hackathon-2026 && cd emmy-hackathon-2026
-pip install emmy-ml==0.3.11 numpy requests   # no torch needed
-python submit.py r01_array_sum examples/k_sum_1_reduce.ptx    # see a pass
-python submit.py p00_scalar_add examples/k_sum_1_reduce.ptx   # wrong entry: a clean failure
-python submit.py p00_scalar_add --compiler compile.py         # your compiler, once you have one
+pip install emmy-ml==0.3.11 numpy requests
 ```
 
-Then open `problems/p00_scalar_add/` and look at three files:
-
-| file | what it is |
-|---|---|
-| `*.ir.json` | the Kernel IR — **the input to your compiler** |
-| `*.ir.txt` | the same IR, pretty-printed for reading |
-| `*.ref.cu` | Emmy's generated CUDA C++ — the reference answer, in a different target language |
-
-Load an IR in Python:
-
-```python
-import json
-from emmy.compiler.graph import Graph
-g = Graph.from_dict(json.load(open("problems/r01_array_sum/k_sum_1_reduce.ir.json")))
-body = g.nodes["sum_1"].op.body     # a tree of typed statements: Tile, StridedLoop, Load, ...
+```bash
+python compile.py path/to/kernel.ir.json > out.ptx
 ```
 
-Your compiler walks that tree and prints PTX. Start with the common node kinds in the short table —
-see [TASK.md](TASK.md) for the categories and the node-by-node translation table.
+or
 
-## The problems
-
-15 open problems in 5 categories, easy → hard: **pointwise → reductions → matmul → fused →
-attention-like**. Each is a folder under `problems/` with the IR, the reference, a launch
-descriptor (`meta.json` — you never guess grid/block), and expected outputs (`expected.npz`).
-
-**MVP: your compiler passes categories 1 and 2.** See [MVP.md](MVP.md).
-
-Problems are scheduled for `sm_89`, and the runner is an **RTX 5090 (`sm_120`)**, where PTX written for `sm_89`
-runs unchanged; [problems/PROVENANCE.md](problems/PROVENANCE.md)
-says how they were generated and checked. The hidden evaluation set contains more problems of the *same kinds* —
-different shapes and ops, no surprise concepts.
-
-## Submitting
-
-Submit at [riftstack.ai/hackathon/submit](https://riftstack.ai/hackathon/submit) before
-**23:59 AoE on Tuesday, October 27**. A submission is:
-
-- a **public GitHub repository** with `compile.py` at its root, runnable as
-  `python compile.py path/to/kernel.ir.json > out.ptx`;
-- a **video of 3 to 5 minutes** in which you walk through your compiler in your own voice
-  (YouTube, Vimeo or Google Drive, shared so that anyone with the link can watch it).
-
-Teams of up to three submit once and list every member. You can submit again until the
-deadline; we review your latest entry. AI coding assistants are allowed, but your video has to
-show that you understand how your compiler works — an entry where the understanding seems to
-have been handed to an AI is not eligible for a prize.
-
-## How compilers are evaluated
-
-We run your `compile.py` on every kernel of the **hidden set** — the same five categories as the
-open problems, with different shapes and ops — then assemble the PTX with `ptxas`, run it on the
-runner's GPU under each problem's `meta.json` launch, and compare the outputs with the expected
-ones within the problem's tolerance. This is the pipeline `submit.py --compiler` runs, so passing
-the open set that way is the best preparation. Keep compiling to seconds per kernel: a time
-limit may apply.
-
-1. **Correctness on the hidden set, by category.** Passing categories 1 and 2 is the bar
-   ([MVP.md](MVP.md)); each further category is what sets submissions apart.
-2. **Code review** of your compiler is the first tiebreak. The IR → PTX lowering has to be your
-   own — see the rule in [TASK.md](TASK.md).
-3. **Speed** of the generated kernels is the last tiebreak.
-
-The video decides prize eligibility, as described above.
-
-## Repo map
-
+```bash
+python submit.py <problem_id> --compiler compile.py
 ```
-problems/     the open set (15 problems)
-examples/     hand-written PTX with comments mapping each block back to the IR
-submit.py     one-command test: compile + run + check against expected outputs
-docs/API.md   the runner API, if you want to call it directly
-tools/        how the problems were generated (emmy compile -c ... --ir cuda)
-TASK.md       the task, the categories, the CLI contract
-MVP.md        the minimum bar
+
+Generate custom inputs
+
+```bash
+EMMY_DUMP_DIR=out emmy compile -c "<torch expr>" --ir kernel
 ```
+
+## Core design
+
+The compiler lowers Emmy's scheduled kernel operations directly to PTX.
+
+The following is an overview:
+![Compiler and runner overview](docs/Overview.svg)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class KernelLowerer {
+        +graph: Graph
+        +ir_kernel: KernelOp
+        +func: PtxFunction
+        +regs: RegisterStore
+        +params: list[FuncParam]
+        +add_instr(opcode, operands, predicate)
+        +plan_shared_memory()
+        +__init__(graph, params, ir_kernel)
+        +lower() PtxFunction
+        -lower_body(body)
+        -lower_stmt(stmt)
+    }
+
+    class Graph {
+        <<input>>
+    }
+    class KernelOp {
+        <<input>>
+        +name: str
+        +body
+        +smem_buffers
+    }
+
+    class PtxFunction {
+        +name: str
+        +params: list[FuncParam]
+        +registers: RegisterStore
+        +instructions: list[PtxInstr or PtxLabel]
+        +label_count: int
+        +shared: dict[str, SharedMemory]
+        +dynamic_shared: bool
+        +shared_align: int
+        +new_label(name) PtxLabel
+        +add_label(label)
+        +add_instr(opcode, operands, predicate)
+    }
+
+    class RegisterStore {
+        +reg_counts: dict[PtxRegisterType, int]
+        +bindings: dict[str, Register]
+        +new(reg_type, varname) Register
+        +bind(name, register)
+        +get_reg(name) Register
+        +scope()
+    }
+    class Register {
+        +name: str
+        +type: PtxRegisterType
+    }
+
+    class FuncParam {
+        +name: str
+        +type: PtxRegisterType
+        +pointee_type: PtxRegisterType or None
+    }
+    class SharedMemory {
+        +name: str
+        +nbytes: int
+        +align: int
+        +offset: int
+    }
+    class PtxInstr {
+        +opcode: str
+        +operands: tuple
+        +predicate: Predicate or None
+    }
+    class PtxLabel {
+        +name: str
+    }
+    class Predicate {
+        +reg: Register
+        +negated: bool
+    }
+
+    Graph ..> KernelLowerer : input
+    KernelOp ..> KernelLowerer : input
+    KernelLowerer *-- PtxFunction : creates and returns
+    PtxFunction *-- RegisterStore : owns
+    PtxFunction o-- FuncParam : parameters
+    PtxFunction o-- PtxInstr : emitted instructions
+    PtxFunction o-- PtxLabel : labels in instruction stream
+    PtxFunction o-- SharedMemory : planned regions
+    RegisterStore o-- Register : named bindings
+    PtxInstr --> Predicate : optional guard
+    Predicate --> Register : tests
+
+    note for KernelLowerer "lower() calls prologue(), then lower_body(ir_kernel.body), emits ret, and returns func.<br/>- lower_body() visits each child node.<br/>- lower_stmt() dispatches by node type to the corresponding lowering logic.<br/>- Nested blocks call lower_body() again, so statement traversal is recursive."
+```
+
+## Implementation checklist
+
+- [x] **1. Pointwise:** `Tile`, `Load`, `Assign`, `Write`.
+- [x] **2. Reductions:** `StridedLoop`, `Accum`, `WarpShuffle`, `Smem`, `Sync`, `TreeHalve`.
+- [x] **3. Matmul:** `Loop`, `Init`, `CpAsyncCopy`, `CpAsyncCommit`, `CpAsyncWait`, atomic `Write`.
+- [ ] **4. Fused.**
+- [ ] **5. Attention-like.**
+
+## Type support and instruction selection
+
+The lowerer keeps Emmy `DataType` separate from PTX register types. `memory_types()` maps supported types to storage/register pairs: `i16` to `s16`/`s32`, `f16` to `b16`/`f16`, and `bool` to `u8`/`s32`. `lower_load()` turns loaded booleans into predicates; `lower_write()` stores them as `0` or `1`. `buffer_address()` selects global or shared memory, while `memory_operands()` emits scalar, `.v2`, or `.v4` accesses.
+
+For `Assign`, `lower_assign()` starts from the result type. `lower_elementwise()` calls `numeric_type()` for add, subtract, multiply, minimum, and maximum. It promotes small integers and predicates to `s32`, and `f16` to `f32`; wider integers and `f32`/`f64` keep their type. It converts operands with `coerce()`, emits the operation, then converts the result back.
+
+Expressions use `lower_binary()` and `coerce_binary()`: logical ops go through `as_pred()`, shifts promote the left value and use a `u32` shift count, and other pairs go through `coerce_pair()`. That helper picks `f64`, then `f32`, or the widest integer type, unsigned when a widest-width operand is unsigned. It converts both operands before opcode selection. `TernaryExpr` uses it to match branch types.
+
+`coerce()` emits conversions: float-to-integer rounds toward zero; integer-to-float and float narrowing round to nearest. `as_pred()` tests for nonzero and uses an unordered float comparison so NaN is true. `lower_binary()` then selects typed instructions, such as `mul.lo.s32`, `mul.f32`, or `setp.lt.f64`.
+
+Some `lower_elementwise()` ops always use `f32`: `divide`, `exp`, `reciprocal`, `relu`, and `sqrt`. `exp` uses `mul.f32` and `ex2.approx.f32`. An `Assign` divide with `f64` inputs loses precision before widening; a `BinaryExpr` divide can use `div.rn.f64`. `WarpShuffle` accepts mapped register types `f32`, `s32`, `u32`, `f64`, `s64`, and `u64`. It splits 64-bit values into two 32-bit words because PTX shuffle moves 32-bit lanes.
